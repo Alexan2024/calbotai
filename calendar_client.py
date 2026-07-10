@@ -147,14 +147,50 @@ def update_event(uid: str, new: Event) -> bool:
 def _parse_component(comp) -> dict:
     start = comp.get("dtstart").dt if comp.get("dtstart") else None
     end = comp.get("dtend").dt if comp.get("dtend") else None
+
+    reminders: list[int] = []
+    for alarm in comp.walk("VALARM"):
+        trig = alarm.get("trigger")
+        if trig is None:
+            continue
+        td = getattr(trig, "dt", None)
+        if isinstance(td, timedelta):
+            reminders.append(int(round(-td.total_seconds() / 60)))
+
     return {
         "uid": str(comp.get("uid")),
         "title": str(comp.get("summary") or "(без названия)"),
         "start": start,
         "end": end,
         "location": str(comp.get("location")) if comp.get("location") else None,
+        "notes": str(comp.get("description")) if comp.get("description") else None,
         "all_day": not isinstance(start, datetime),
+        "reminders_minutes": reminders,
     }
+
+
+def get_event(uid: str) -> dict | None:
+    """Прочитать одно событие по UID целиком (с заметками и напоминаниями).
+
+    Нужно, чтобы правки (перенос/переименование/напоминания) не затирали
+    поля, которых нет в кратком списке из list_events.
+    """
+    def op():
+        calendar = _connect()
+        try:
+            obj = calendar.event_by_uid(uid)
+        except caldav.error.NotFoundError:
+            return None
+        for comp in obj.icalendar_instance.walk("VEVENT"):
+            return _parse_component(comp)
+        return None
+    try:
+        return op()
+    except caldav.error.NotFoundError:
+        return None
+    except Exception:
+        _reset()
+        return op()
 
 
 def list_events(dt_from: datetime, dt_to: datetime) -> list[dict]:
@@ -181,7 +217,7 @@ def list_events(dt_from: datetime, dt_to: datetime) -> list[dict]:
 
 
 def find_by_title(title: str, dt_from: datetime, dt_to: datetime) -> list[dict]:
-    """Нечёткий поиск события по названию в интервале (для редактирования)."""
+    """Нечёткий поиск события по названию в интервале (для текстовых правок)."""
     needle = title.lower().strip()
     matches = []
     for e in list_events(dt_from, dt_to):
