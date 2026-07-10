@@ -243,6 +243,11 @@ async def cmd_week(message: Message):
 async def on_voice(message: Message, bot: Bot):
     if not allowed(message):
         return
+    if not transcribe.enabled():
+        await message.answer(
+            "Голосовые сейчас отключены. Пришли событие текстом или фото афиши 🙂"
+        )
+        return
     file_id = message.voice.file_id if message.voice else message.audio.file_id
     audio = await download(bot, file_id)
     try:

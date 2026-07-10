@@ -20,13 +20,21 @@
 1. **Python 3.11+**
 2. **Telegram-бот**: у [@BotFather](https://t.me/BotFather) → `/newbot` → токен.
    Свой user id — у [@userinfobot](https://t.me/userinfobot).
-3. **OpenAI API-ключ**: platform.openai.com (используется Whisper + gpt-4o).
-   Модель можно поменять в `.env` (`LLM_MODEL`), любую vision-совместимую.
-4. **Apple ID + пароль приложения** (это ключевой момент):
+3. **API-ключ Claude**: console.anthropic.com — используется для разбора текста
+   и афиш (у моделей Claude есть зрение). Модель задаётся в `LLM_MODEL`
+   (по умолчанию `claude-sonnet-5`; дешевле — `claude-haiku-4-5`).
+4. **Распознавание речи для голосовых** (у Claude нет STT — нужен отдельный провайдер):
+   - `STT_PROVIDER=openai` + `OPENAI_API_KEY` (Whisper от OpenAI), или
+   - `STT_PROVIDER=groq` + `GROQ_API_KEY` (Whisper на Groq, дёшево/быстро), или
+   - `STT_PROVIDER=none` — голосовые отключены, работают только текст и фото.
+5. **Apple ID + пароль приложения** (это ключевой момент):
    - зайди на appleid.apple.com → **Вход и безопасность** → **Пароли приложений**
    - создай пароль (вид `abcd-efgh-ijkl-mnop`) и вставь в `ICLOUD_PASSWORD`
    - обычный пароль от Apple ID **не подойдёт** — нужен именно app-specific
    - двухфакторная аутентификация должна быть включена
+
+Мозги (`llm.py`) и распознавание речи (`transcribe.py`) вынесены в отдельные модули,
+так что провайдера можно менять, не трогая остальной код.
 
 ## Установка
 

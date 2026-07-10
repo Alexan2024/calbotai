@@ -1,25 +1,28 @@
 """Разбор произвольного ввода (текст/картинка) в структурированное намерение.
 
-Возвращает JSON вида:
+Мозги на Claude (Anthropic Messages API). Все модели Claude поддерживают
+текст и изображения, поэтому и разбор текста, и распознавание афиш идут здесь.
+Аудио Claude не принимает — голос расшифровывается отдельно (см. transcribe.py).
+
+Возвращает JSON:
 {
   "intent": "create" | "edit" | "query" | "chitchat",
   "events": [ {title, start, end, all_day, location, notes, reminders_minutes} ],
   "query": {"from": ISO, "to": ISO} | null,
-  "edit": {"match_title": str, "changes": {...same event fields...}} | null,
-  "reply": "короткий ответ пользователю, если intent=chitchat"
+  "edit": {"match_title": str, "changes": {...}} | null,
+  "reply": "строка или null"
 }
-Все даты — ISO 8601 с учётом часового пояса пользователя.
 """
 from __future__ import annotations
 import base64
 import json
 from datetime import datetime
 
-from openai import AsyncOpenAI
+from anthropic import AsyncAnthropic
 
 import config
 
-client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+client = AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
 
 
 def _system_prompt(now: datetime, tz: str) -> str:
@@ -32,7 +35,7 @@ def _system_prompt(now: datetime, tz: str) -> str:
 Все относительные даты («завтра», «в пятницу», «через час», «сегодня вечером»)
 считай от текущего момента и возвращай абсолютными в ISO 8601 с оффсетом пояса.
 
-Верни СТРОГО JSON без markdown со схемой:
+Верни СТРОГО один JSON-объект без markdown и без пояснений, со схемой:
 {{
   "intent": "create" | "edit" | "query" | "chitchat",
   "events": [
@@ -60,28 +63,39 @@ def _system_prompt(now: datetime, tz: str) -> str:
 - intent=chitchat — если это не про календарь; дай короткий ответ в reply.
 - Если время не указано, но есть дата — можно all_day=true.
 - Если конца нет — оставь end=null (длительность подставит бот).
-- reminders_minutes оставляй пустым, если пользователь явно не просил напоминание;
-  значения по умолчанию бот добавит сам.
+- reminders_minutes оставляй пустым, если пользователь явно не просил напоминание.
 - Не выдумывай место или детали, которых нет во вводе. Пустое поле лучше выдумки.
-- Может быть несколько событий (например, «в пн зал, в ср врач») — верни их все.
+- Может быть несколько событий — верни их все.
 """
 
 
-async def _chat(messages: list[dict]) -> dict:
-    resp = await client.chat.completions.create(
+def _extract_json(resp) -> dict:
+    """Собрать текст из всех text-блоков ответа (пропуская thinking) и распарсить."""
+    text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lstrip().lower().startswith("json"):
+            text = text.lstrip()[4:]
+    # взять от первой { до последней }
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end != -1:
+        text = text[start:end + 1]
+    return json.loads(text)
+
+
+async def _ask(system: str, user_content) -> dict:
+    resp = await client.messages.create(
         model=config.LLM_MODEL,
-        messages=messages,
-        response_format={"type": "json_object"},
-        temperature=0,
+        max_tokens=2000,
+        system=system,
+        messages=[{"role": "user", "content": user_content}],
     )
-    return json.loads(resp.choices[0].message.content)
+    return _extract_json(resp)
 
 
 async def parse_text(text: str, now: datetime, tz: str) -> dict:
-    return await _chat([
-        {"role": "system", "content": _system_prompt(now, tz)},
-        {"role": "user", "content": text},
-    ])
+    return await _ask(_system_prompt(now, tz), text)
 
 
 async def parse_image(image_bytes: bytes, caption: str, now: datetime, tz: str) -> dict:
@@ -89,9 +103,9 @@ async def parse_image(image_bytes: bytes, caption: str, now: datetime, tz: str) 
     prompt = caption or "Извлеки событие(я) с этого изображения (афиша/скриншот)."
     user_content = [
         {"type": "text", "text": prompt},
-        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
+        },
     ]
-    return await _chat([
-        {"role": "system", "content": _system_prompt(now, tz)},
-        {"role": "user", "content": user_content},
-    ])
+    return await _ask(_system_prompt(now, tz), user_content)
