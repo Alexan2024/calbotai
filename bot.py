@@ -146,7 +146,7 @@ def _iso(s: str | None) -> datetime | None:
 
 async def send_schedule(message: Message, dt_from: datetime, dt_to: datetime):
     try:
-        events = cal.list_events(dt_from, dt_to)
+        events = await asyncio.to_thread(cal.list_events, dt_from, dt_to)
     except Exception as e:
         await message.answer(f"⚠️ Не смог прочитать календарь: {e}")
         return
@@ -170,7 +170,9 @@ async def handle_edit(message: Message, edit: dict):
         await message.answer("Какое событие изменить? Напиши название.")
         return
     # ищем в окне ±60 дней
-    matches = cal.find_by_title(title, now() - timedelta(days=30), now() + timedelta(days=60))
+    matches = await asyncio.to_thread(
+        cal.find_by_title, title, now() - timedelta(days=30), now() + timedelta(days=60)
+    )
     if not matches:
         await message.answer(f"Не нашёл событие «{title}» в календаре.")
         return
@@ -285,19 +287,21 @@ async def on_text(message: Message):
 
 @dp.callback_query(F.data.startswith("ok:"))
 async def on_ok(cq: CallbackQuery):
+    await cq.answer()  # сразу гасим «часики» на кнопке
     token = cq.data.split(":", 1)[1]
     data = PENDING.pop(token, None)
     if not data:
-        await cq.answer("Действие устарело.")
+        await cq.message.edit_text("Действие устарело — пришли событие заново.")
         return
     ev = Event.from_dict(data["event"])
+    await cq.message.edit_text("⏳ Записываю в календарь…")
     try:
         if data["action"] == "create":
-            uid = cal.create_event(ev)
+            uid = await asyncio.to_thread(cal.create_event, ev)
             store.add(uid, data["chat_id"], ev.title, ev.start)
             await cq.message.edit_text("✅ Добавлено в календарь\n\n" + event_card(ev))
         else:  # edit
-            ok = cal.update_event(data["uid"], ev)
+            ok = await asyncio.to_thread(cal.update_event, data["uid"], ev)
             if ok:
                 store.update_start(data["uid"], ev.title, ev.start)
                 await cq.message.edit_text("✅ Изменено\n\n" + event_card(ev))
@@ -305,7 +309,6 @@ async def on_ok(cq: CallbackQuery):
                 await cq.message.edit_text("⚠️ Событие не найдено в календаре.")
     except Exception as e:
         await cq.message.edit_text(f"⚠️ Ошибка записи в календарь: {e}")
-    await cq.answer()
 
 
 @dp.callback_query(F.data.startswith("no:"))
