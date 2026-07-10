@@ -43,7 +43,15 @@ def _connect() -> "caldav.Calendar":
                 f"Календарь '{config.ICLOUD_CALENDAR_NAME}' не найден. Доступны: {names}"
             )
     else:
-        _calendar = calendars[0]
+        chosen = None
+        for c in calendars:
+            try:
+                if "VEVENT" in c.get_supported_components():
+                    chosen = c
+                    break
+            except Exception:
+                continue
+        _calendar = chosen or calendars[0]
     return _calendar
 
 
