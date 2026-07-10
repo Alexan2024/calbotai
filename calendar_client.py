@@ -19,6 +19,12 @@ TZ = pytz.timezone(config.TIMEZONE)
 _calendar = None  # кэш выбранного caldav.Calendar
 
 
+def _reset():
+    """Сбросить кэш соединения — при следующем вызове подключимся заново."""
+    global _calendar
+    _calendar = None
+
+
 def _connect() -> "caldav.Calendar":
     global _calendar
     if _calendar is not None:
@@ -27,6 +33,7 @@ def _connect() -> "caldav.Calendar":
         url=config.CALDAV_URL,
         username=config.ICLOUD_USERNAME,
         password=config.ICLOUD_PASSWORD,
+        timeout=30,
     )
     principal = client.principal()
     calendars = principal.calendars()
@@ -100,11 +107,17 @@ def _build_ical(ev: Event) -> tuple[str, bytes]:
 
 
 def create_event(ev: Event) -> str:
-    """Создать событие. Возвращает UID."""
-    calendar = _connect()
-    uid, ical = _build_ical(ev)
-    calendar.save_event(ical.decode())
-    return uid
+    """Создать событие. Возвращает UID. При сбое — переподключение и повтор."""
+    def op() -> str:
+        calendar = _connect()
+        uid, ical = _build_ical(ev)
+        calendar.save_event(ical.decode())
+        return uid
+    try:
+        return op()
+    except Exception:
+        _reset()
+        return op()
 
 
 def delete_event(uid: str) -> bool:
@@ -146,13 +159,19 @@ def _parse_component(comp) -> dict:
 
 def list_events(dt_from: datetime, dt_to: datetime) -> list[dict]:
     """События в интервале, отсортированные по началу."""
-    calendar = _connect()
-    results = calendar.search(
-        start=_aware(dt_from),
-        end=_aware(dt_to),
-        event=True,
-        expand=True,
-    )
+    def op():
+        calendar = _connect()
+        return calendar.search(
+            start=_aware(dt_from),
+            end=_aware(dt_to),
+            event=True,
+            expand=True,
+        )
+    try:
+        results = op()
+    except Exception:
+        _reset()
+        results = op()
     out: list[dict] = []
     for r in results:
         for comp in r.icalendar_instance.walk("VEVENT"):
