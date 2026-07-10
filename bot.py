@@ -4,6 +4,9 @@ UX кнопочный: постоянная reply-клавиатура (Сего
 инлайн-навигация по дням, тапабельные события с действиями (перенос, переименование,
 напоминания, удаление). Правки идут по UID события, а не по нечёткому совпадению
 названия — надёжнее. Текстовый разбор («перенеси врача») остаётся как запасной путь.
+
+Если у пользователя несколько писабельных календарей, при добавлении события
+показывается выбор календаря (кнопки-календари = подтверждение записи именно туда).
 """
 from __future__ import annotations
 import asyncio
@@ -47,13 +50,13 @@ CATEGORY_EMOJI = {
 REMINDER_PRESETS = [10, 60, 1440]  # 10 мин, 1 час, 1 день
 
 # --- состояние в памяти ---
-# подтверждения создания/правки: token -> {"action","event","chat_id",...}
+# подтверждения создания/правки: token -> {"action","event","chat_id","calendars"/"calendar",...}
 PENDING: dict[str, dict] = {}
-# тапнутые события календаря: token -> {"uid","offset"}
+# тапнутые события календаря: token -> {"uid","offset","calendar"}
 EVENTS: dict[str, dict] = {}
 # рабочий набор напоминаний в меню существующего события: token -> set(minutes)
 REMWORK: dict[str, set] = {}
-# ожидание текстового ввода: user_id -> {"mode","uid"/"token"}
+# ожидание текстового ввода: user_id -> {"mode","uid"/"token","calendar"}
 AWAITING: dict[int, dict] = {}
 
 
@@ -167,6 +170,14 @@ def _iso(s: str | None) -> datetime | None:
         return None
 
 
+async def _fetch_calendar_names() -> list[str]:
+    """Список писабельных календарей; пустой при ошибке (тогда выбор не показываем)."""
+    try:
+        return await asyncio.to_thread(cal.calendar_names)
+    except Exception:
+        return []
+
+
 # ---------- клавиатуры подтверждения / напоминаний ----------
 
 def reminder_toggle_row(active: set, prefix: str, token: str) -> list[InlineKeyboardButton]:
@@ -180,15 +191,27 @@ def reminder_toggle_row(active: set, prefix: str, token: str) -> list[InlineKeyb
     return row
 
 
-def create_confirm_kb(token: str, active: set) -> InlineKeyboardMarkup:
+def _create_prompt(calendars: list[str]) -> str:
+    return "Выбери календарь для события:" if len(calendars) > 1 else "Добавить в календарь?"
+
+
+def create_confirm_kb(token: str, active: set, calendars: list[str]) -> InlineKeyboardMarkup:
     rows = [
         reminder_toggle_row(active, "crt", token),
         [InlineKeyboardButton(text="✏️ Своё напоминание", callback_data=f"crc:{token}")],
-        [
+    ]
+    if len(calendars) > 1:
+        # кнопка-календарь = подтверждение записи именно туда
+        for idx, name in enumerate(calendars):
+            rows.append([InlineKeyboardButton(
+                text=f"📅 {name}"[:60], callback_data=f"addc:{token}:{idx}",
+            )])
+        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"no:{token}")])
+    else:
+        rows.append([
             InlineKeyboardButton(text="✅ Добавить", callback_data=f"ok:{token}"),
             InlineKeyboardButton(text="❌ Отмена", callback_data=f"no:{token}"),
-        ],
-    ]
+        ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -209,14 +232,15 @@ async def handle_parsed(message: Message, parsed: dict):
         if not events:
             await message.answer("Не увидел события. Уточни дату/время?")
             return
+        calendars = await _fetch_calendar_names()  # один раз на пачку событий
         for ed in events:
             ev = event_from_llm(ed)
             token = new_token()
             PENDING[token] = {"action": "create", "event": ev.to_dict(),
-                              "chat_id": message.chat.id}
+                              "chat_id": message.chat.id, "calendars": calendars}
             await message.answer(
-                event_card(ev) + "\n\nДобавить в календарь?",
-                reply_markup=create_confirm_kb(token, set(ev.reminders_minutes)),
+                event_card(ev) + "\n\n" + _create_prompt(calendars),
+                reply_markup=create_confirm_kb(token, set(ev.reminders_minutes), calendars),
             )
 
     elif intent == "query":
@@ -283,7 +307,7 @@ async def handle_edit(message: Message, edit: dict):
         return
 
     target = matches[0]
-    base = await asyncio.to_thread(cal.get_event, target["uid"]) or target
+    base = await asyncio.to_thread(cal.get_event, target["uid"], target.get("calendar")) or target
     new = event_from_caldav(base)
     if changes.get("title"):
         new.title = changes["title"]
@@ -300,7 +324,8 @@ async def handle_edit(message: Message, edit: dict):
 
     token = new_token()
     PENDING[token] = {"action": "edit", "event": new.to_dict(),
-                      "uid": target["uid"], "chat_id": message.chat.id}
+                      "uid": target["uid"], "calendar": target.get("calendar"),
+                      "chat_id": message.chat.id}
     await message.answer(
         "Изменить на:\n\n" + event_card(new) + "\n\nПрименить?",
         reply_markup=edit_confirm_kb(token),
@@ -350,7 +375,7 @@ async def render_day(offset: int) -> tuple[str, InlineKeyboardMarkup]:
         lines = [f"🗓 <b>{day_title(offset)}</b>", "", "Тапни событие, чтобы изменить:"]
         for e in events:
             token = new_token()
-            EVENTS[token] = {"uid": e["uid"], "offset": offset}
+            EVENTS[token] = {"uid": e["uid"], "offset": offset, "calendar": e.get("calendar")}
             when = (e["start"].astimezone(TZ).strftime("%H:%M")
                     if isinstance(e["start"], datetime) and not e["all_day"] else "весь день")
             rows.append([InlineKeyboardButton(
@@ -405,7 +430,7 @@ async def show_event_card(cq: CallbackQuery, token: str):
     if not data:
         await cq.message.edit_text("Событие устарело — открой список заново (📅 Сегодня).")
         return
-    ev_dict = await asyncio.to_thread(cal.get_event, data["uid"])
+    ev_dict = await asyncio.to_thread(cal.get_event, data["uid"], data.get("calendar"))
     if not ev_dict:
         await cq.message.edit_text("⚠️ Событие не найдено (возможно, удалено).")
         return
@@ -472,7 +497,7 @@ async def btn_reminders(message: Message):
     rows = []
     for e in events[:20]:
         token = new_token()
-        EVENTS[token] = {"uid": e["uid"], "offset": 0}
+        EVENTS[token] = {"uid": e["uid"], "offset": 0, "calendar": e.get("calendar")}
         rem = ("🔔 " + ", ".join(rem_label(m) for m in e["reminders_minutes"])
                if e.get("reminders_minutes") else "🔕 нет")
         rows.append([InlineKeyboardButton(
@@ -540,16 +565,16 @@ async def handle_awaited_text(message: Message, pending: dict):
     mode = pending.get("mode")
 
     if mode == "rename":
-        ev_dict = await asyncio.to_thread(cal.get_event, pending["uid"])
+        ev_dict = await asyncio.to_thread(cal.get_event, pending["uid"], pending.get("calendar"))
         if not ev_dict:
             await message.answer("⚠️ Событие не найдено.")
             return
         ev = event_from_caldav(ev_dict)
         ev.title = message.text.strip()
-        await _apply_update(message, pending["uid"], ev, "✅ Переименовано")
+        await _apply_update(message, pending["uid"], ev, "✅ Переименовано", pending.get("calendar"))
 
     elif mode == "reschedule":
-        ev_dict = await asyncio.to_thread(cal.get_event, pending["uid"])
+        ev_dict = await asyncio.to_thread(cal.get_event, pending["uid"], pending.get("calendar"))
         if not ev_dict:
             await message.answer("⚠️ Событие не найдено.")
             return
@@ -564,7 +589,7 @@ async def handle_awaited_text(message: Message, pending: dict):
             return
         ev = event_from_caldav(ev_dict)
         _shift_to(ev, new_start, _iso(when.get("end")), bool(when.get("all_day")))
-        await _apply_update(message, pending["uid"], ev, "✅ Перенесено")
+        await _apply_update(message, pending["uid"], ev, "✅ Перенесено", pending.get("calendar"))
 
     elif mode == "remind_custom":
         m = _parse_reminder_minutes(message.text)
@@ -580,9 +605,10 @@ async def handle_awaited_text(message: Message, pending: dict):
         rem.add(m)
         data["event"]["reminders_minutes"] = sorted(rem)
         ev = Event.from_dict(data["event"])
+        calendars = data.get("calendars") or []
         await message.answer(
-            event_card(ev) + "\n\nДобавить в календарь?",
-            reply_markup=create_confirm_kb(token, set(ev.reminders_minutes)),
+            event_card(ev) + "\n\n" + _create_prompt(calendars),
+            reply_markup=create_confirm_kb(token, set(ev.reminders_minutes), calendars),
         )
 
 
@@ -611,9 +637,10 @@ def _parse_reminder_minutes(text: str) -> int | None:
     return n
 
 
-async def _apply_update(message: Message, uid: str, ev: Event, ok_text: str):
+async def _apply_update(message: Message, uid: str, ev: Event, ok_text: str,
+                        calendar_name: str | None = None):
     try:
-        ok = await asyncio.to_thread(cal.update_event, uid, ev)
+        ok = await asyncio.to_thread(cal.update_event, uid, ev, calendar_name)
     except Exception as e:
         await message.answer(f"⚠️ Ошибка записи в календарь: {e}")
         return
@@ -673,7 +700,7 @@ async def cb_reschedule_preset(cq: CallbackQuery):
     if not data:
         await cq.answer("Событие устарело", show_alert=True)
         return
-    ev_dict = await asyncio.to_thread(cal.get_event, data["uid"])
+    ev_dict = await asyncio.to_thread(cal.get_event, data["uid"], data.get("calendar"))
     if not ev_dict:
         await cq.message.edit_text("⚠️ Событие не найдено.")
         await cq.answer()
@@ -684,7 +711,7 @@ async def cb_reschedule_preset(cq: CallbackQuery):
     if ev.end:
         ev.end = _to_dt(ev.end) + delta
     try:
-        ok = await asyncio.to_thread(cal.update_event, data["uid"], ev)
+        ok = await asyncio.to_thread(cal.update_event, data["uid"], ev, data.get("calendar"))
     except Exception as e:
         await cq.message.edit_text(f"⚠️ Ошибка записи: {e}")
         await cq.answer()
@@ -705,7 +732,8 @@ async def cb_reschedule_manual(cq: CallbackQuery):
     if not data:
         await cq.answer("Событие устарело", show_alert=True)
         return
-    AWAITING[cq.from_user.id] = {"mode": "reschedule", "uid": data["uid"]}
+    AWAITING[cq.from_user.id] = {"mode": "reschedule", "uid": data["uid"],
+                                 "calendar": data.get("calendar")}
     await cq.message.edit_text("🕒 Напиши новое время, например «завтра в 15:00» или «в пятницу 18:00».")
     await cq.answer()
 
@@ -719,7 +747,8 @@ async def cb_rename(cq: CallbackQuery):
     if not data:
         await cq.answer("Событие устарело", show_alert=True)
         return
-    AWAITING[cq.from_user.id] = {"mode": "rename", "uid": data["uid"]}
+    AWAITING[cq.from_user.id] = {"mode": "rename", "uid": data["uid"],
+                                 "calendar": data.get("calendar")}
     await cq.message.edit_text("✏️ Напиши новое название события.")
     await cq.answer()
 
@@ -733,7 +762,7 @@ async def cb_reminder_menu(cq: CallbackQuery):
     if not data:
         await cq.answer("Событие устарело", show_alert=True)
         return
-    ev_dict = await asyncio.to_thread(cal.get_event, data["uid"])
+    ev_dict = await asyncio.to_thread(cal.get_event, data["uid"], data.get("calendar"))
     if not ev_dict:
         await cq.message.edit_text("⚠️ Событие не найдено.")
         await cq.answer()
@@ -775,7 +804,7 @@ async def cb_reminder_save(cq: CallbackQuery):
     if not data:
         await cq.answer("Событие устарело", show_alert=True)
         return
-    ev_dict = await asyncio.to_thread(cal.get_event, data["uid"])
+    ev_dict = await asyncio.to_thread(cal.get_event, data["uid"], data.get("calendar"))
     if not ev_dict:
         await cq.message.edit_text("⚠️ Событие не найдено.")
         await cq.answer()
@@ -783,7 +812,7 @@ async def cb_reminder_save(cq: CallbackQuery):
     ev = event_from_caldav(ev_dict)
     ev.reminders_minutes = sorted(REMWORK.get(token, set()))
     try:
-        ok = await asyncio.to_thread(cal.update_event, data["uid"], ev)
+        ok = await asyncio.to_thread(cal.update_event, data["uid"], ev, data.get("calendar"))
     except Exception as e:
         await cq.message.edit_text(f"⚠️ Ошибка записи: {e}")
         await cq.answer()
@@ -816,7 +845,7 @@ async def cb_delete_yes(cq: CallbackQuery):
         await cq.answer("Событие устарело", show_alert=True)
         return
     try:
-        ok = await asyncio.to_thread(cal.delete_event, data["uid"])
+        ok = await asyncio.to_thread(cal.delete_event, data["uid"], data.get("calendar"))
     except Exception as e:
         await cq.message.edit_text(f"⚠️ Ошибка удаления: {e}")
         await cq.answer()
@@ -843,9 +872,10 @@ async def cb_create_reminder_toggle(cq: CallbackQuery):
     rem.discard(m) if m in rem else rem.add(m)
     data["event"]["reminders_minutes"] = sorted(rem)
     ev = Event.from_dict(data["event"])
+    calendars = data.get("calendars") or []
     await cq.message.edit_text(
-        event_card(ev) + "\n\nДобавить в календарь?",
-        reply_markup=create_confirm_kb(token, rem),
+        event_card(ev) + "\n\n" + _create_prompt(calendars),
+        reply_markup=create_confirm_kb(token, rem, calendars),
     )
     await cq.answer()
 
@@ -860,6 +890,27 @@ async def cb_create_reminder_custom(cq: CallbackQuery):
     await cq.answer("Напиши, за сколько напомнить — например «за 30 минут»", show_alert=True)
 
 
+async def _commit_pending(cq: CallbackQuery, data: dict, calendar_name: str | None = None):
+    """Записать отложенное действие (создание/правку) в календарь."""
+    ev = Event.from_dict(data["event"])
+    await cq.message.edit_text("⏳ Записываю в календарь…")
+    try:
+        if data["action"] == "create":
+            uid, cname = await asyncio.to_thread(cal.create_event, ev, calendar_name)
+            store.add(uid, data["chat_id"], ev.title, ev.start, cname)
+            suffix = f"\n\n📅 {cname}" if cname else ""
+            await cq.message.edit_text("✅ Добавлено в календарь\n\n" + event_card(ev) + suffix)
+        else:  # edit
+            ok = await asyncio.to_thread(cal.update_event, data["uid"], ev, data.get("calendar"))
+            if ok:
+                store.update_start(data["uid"], ev.title, ev.start)
+                await cq.message.edit_text("✅ Изменено\n\n" + event_card(ev))
+            else:
+                await cq.message.edit_text("⚠️ Событие не найдено в календаре.")
+    except Exception as e:
+        await cq.message.edit_text(f"⚠️ Ошибка записи в календарь: {e}")
+
+
 @dp.callback_query(F.data.startswith("ok:"))
 async def on_ok(cq: CallbackQuery):
     await cq.answer()
@@ -868,22 +919,24 @@ async def on_ok(cq: CallbackQuery):
     if not data:
         await cq.message.edit_text("Действие устарело — пришли событие заново.")
         return
-    ev = Event.from_dict(data["event"])
-    await cq.message.edit_text("⏳ Записываю в календарь…")
+    await _commit_pending(cq, data, None)  # календарь по умолчанию
+
+
+@dp.callback_query(F.data.startswith("addc:"))
+async def on_ok_calendar(cq: CallbackQuery):
+    """Подтверждение создания с выбором конкретного календаря."""
+    await cq.answer()
+    _, token, idx = cq.data.split(":")
+    data = PENDING.pop(token, None)
+    if not data:
+        await cq.message.edit_text("Действие устарело — пришли событие заново.")
+        return
+    calendars = data.get("calendars") or []
     try:
-        if data["action"] == "create":
-            uid = await asyncio.to_thread(cal.create_event, ev)
-            store.add(uid, data["chat_id"], ev.title, ev.start)
-            await cq.message.edit_text("✅ Добавлено в календарь\n\n" + event_card(ev))
-        else:  # edit
-            ok = await asyncio.to_thread(cal.update_event, data["uid"], ev)
-            if ok:
-                store.update_start(data["uid"], ev.title, ev.start)
-                await cq.message.edit_text("✅ Изменено\n\n" + event_card(ev))
-            else:
-                await cq.message.edit_text("⚠️ Событие не найдено в календаре.")
-    except Exception as e:
-        await cq.message.edit_text(f"⚠️ Ошибка записи в календарь: {e}")
+        cname = calendars[int(idx)]
+    except (ValueError, IndexError):
+        cname = None
+    await _commit_pending(cq, data, cname)
 
 
 @dp.callback_query(F.data.startswith("no:"))
