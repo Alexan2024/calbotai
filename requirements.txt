@@ -6,3 +6,4 @@ icalendar>=5.0.11
 python-dotenv>=1.0.1
 pytz>=2024.1
 APScheduler>=3.10.4
+cryptography>=42.0   # шифрование паролей приложений в SQLite (security.py)
