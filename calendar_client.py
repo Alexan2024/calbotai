@@ -1,13 +1,8 @@
-"""Обёртка над iCloud CalDAV: создание, редактирование, удаление, выборка событий.
+"""iCloud CalDAV, мультипользовательский: у каждого пользователя свой аккаунт.
 
-iCloud требует Apple ID + пароль приложения (app-specific password).
-Подключение ленивое и кэшируется.
-
-Поддержка нескольких календарей:
-- `calendar_names()` — список писабельных (VEVENT) календарей для выбора в боте;
-- `create_event(ev, calendar_name)` — запись в конкретный календарь;
-- чтение/правки/удаление умеют работать по имени календаря, а при его отсутствии
-  ищут событие во всех писабельных календарях (fallback), чтобы ничего не терять.
+UserCalDAV — обёртка над одним Apple ID (пароль приложения) с ленивым
+подключением и переподключением при сбое. for_user(user_id) достаёт креды
+из store, расшифровывает пароль и кэширует инстанс.
 """
 from __future__ import annotations
 import uuid
@@ -18,123 +13,40 @@ import pytz
 from icalendar import Calendar as ICalendar, Event as IEvent, Alarm
 
 import config
+import security
+import store
 from models import Event
 
-TZ = pytz.timezone(config.TIMEZONE)
-
-# --- кэш соединения и календарей ---
-_principal = None
-_by_name: dict[str, "caldav.Calendar"] = {}
-_writable: list["caldav.Calendar"] | None = None
+DEFAULT_TZ = pytz.timezone(config.TIMEZONE)
 
 
-def _reset():
-    """Сбросить кэш соединения — при следующем вызове подключимся заново."""
-    global _principal, _by_name, _writable
-    _principal = None
-    _by_name = {}
-    _writable = None
+# ---------- общие помощники ----------
 
-
-def _principal_obj():
-    global _principal
-    if _principal is None:
-        client = caldav.DAVClient(
-            url=config.CALDAV_URL,
-            username=config.ICLOUD_USERNAME,
-            password=config.ICLOUD_PASSWORD,
-            timeout=30,
-        )
-        _principal = client.principal()
-    return _principal
-
-
-def _cal_name(c) -> str:
-    return (c.name or "").strip() or "Без имени"
-
-
-def _load_calendars() -> list["caldav.Calendar"]:
-    """Загрузить и закэшировать все календари; выделить писабельные (VEVENT)."""
-    global _by_name, _writable
-    cals = _principal_obj().calendars()
-    if not cals:
-        raise RuntimeError("В iCloud не найдено ни одного календаря.")
-    _by_name = {}
-    writable: list["caldav.Calendar"] = []
-    for c in cals:
-        _by_name[_cal_name(c)] = c
+def _writable(calendars) -> list:
+    """Только календари, принимающие VEVENT (не Reminders/Birthdays)."""
+    out = []
+    for c in calendars:
         try:
             if "VEVENT" in c.get_supported_components():
-                writable.append(c)
+                out.append(c)
         except Exception:
-            # обнаружение компонентов иногда капризничает — не прячем календарь
-            writable.append(c)
-    _writable = writable or list(cals)
-    return _writable
-
-
-def _writable_calendars() -> list["caldav.Calendar"]:
-    if _writable is None:
-        _load_calendars()
-    return _writable
-
-
-def calendar_names() -> list[str]:
-    """Имена писабельных календарей (для кнопок выбора в боте)."""
-    def op():
-        return [_cal_name(c) for c in _writable_calendars()]
-    try:
-        return op()
-    except Exception:
-        _reset()
-        return op()
-
-
-def _resolve(calendar_name: str | None):
-    """Календарь для записи: по имени, иначе из конфига, иначе первый писабельный."""
-    _writable_calendars()  # гарантирует загрузку _by_name/_writable
-    if calendar_name:
-        c = _by_name.get(calendar_name.strip())
-        if c is not None:
-            return c
-    if config.ICLOUD_CALENDAR_NAME:
-        c = _by_name.get(config.ICLOUD_CALENDAR_NAME.strip())
-        if c is not None:
-            return c
-    return _writable_calendars()[0]
-
-
-def _find_object(uid: str, calendar_name: str | None = None):
-    """Найти caldav-объект события по UID.
-
-    Сначала пробуем указанный календарь, затем перебираем остальные писабельные.
-    Возвращает (obj, calendar_name) или (None, None).
-    """
-    _writable_calendars()  # загрузить кэш
-    order: list["caldav.Calendar"] = []
-    if calendar_name:
-        c = _by_name.get(calendar_name.strip())
-        if c is not None:
-            order.append(c)
-    for c in _writable_calendars():
-        if c not in order:
-            order.append(c)
-    for c in order:
-        try:
-            obj = c.event_by_uid(uid)
-            return obj, _cal_name(c)
-        except caldav.error.NotFoundError:
             continue
-    return None, None
+    return out
 
 
-def _aware(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        return TZ.localize(dt)
-    return dt
+def test_connection(username: str, password: str) -> list[str]:
+    """Проверить креды и вернуть имена календарей для событий. Бросает при ошибке."""
+    client = caldav.DAVClient(
+        url=config.CALDAV_URL, username=username, password=password, timeout=30,
+    )
+    return [c.name or "?" for c in _writable(client.principal().calendars())]
 
 
-def _build_ical(ev: Event) -> tuple[str, bytes]:
+def _aware(dt: datetime, tz) -> datetime:
+    return tz.localize(dt) if dt.tzinfo is None else dt
+
+
+def _build_ical(ev: Event, tz) -> tuple[str, bytes]:
     """Собрать VEVENT (+ VALARM) и вернуть (uid, ical_bytes)."""
     cal = ICalendar()
     cal.add("prodid", "-//tgcalbot//RU")
@@ -151,8 +63,8 @@ def _build_ical(ev: Event) -> tuple[str, bytes]:
         ie.add("dtstart", d)
         ie.add("dtend", (d + timedelta(days=1)))
     else:
-        start = _aware(ev.start)
-        end = _aware(ev.end) if ev.end else start + timedelta(hours=1)
+        start = _aware(ev.start, tz)
+        end = _aware(ev.end, tz) if ev.end else start + timedelta(hours=1)
         ie.add("dtstart", start)
         ie.add("dtend", end)
 
@@ -170,59 +82,6 @@ def _build_ical(ev: Event) -> tuple[str, bytes]:
 
     cal.add_component(ie)
     return uid, cal.to_ical()
-
-
-def create_event(ev: Event, calendar_name: str | None = None) -> tuple[str, str]:
-    """Создать событие в выбранном (или дефолтном) календаре.
-
-    Возвращает (uid, calendar_name). При сбое — переподключение и повтор.
-    """
-    def op() -> tuple[str, str]:
-        calendar = _resolve(calendar_name)
-        uid, ical = _build_ical(ev)
-        calendar.save_event(ical.decode())
-        return uid, _cal_name(calendar)
-    try:
-        return op()
-    except Exception:
-        _reset()
-        return op()
-
-
-def delete_event(uid: str, calendar_name: str | None = None) -> bool:
-    def op() -> bool:
-        obj, _ = _find_object(uid, calendar_name)
-        if obj is None:
-            return False
-        obj.delete()
-        return True
-    try:
-        return op()
-    except caldav.error.NotFoundError:
-        return False
-    except Exception:
-        _reset()
-        return op()
-
-
-def update_event(uid: str, new: Event, calendar_name: str | None = None) -> bool:
-    """Полностью переписать событие с данным UID новыми значениями."""
-    def op() -> bool:
-        obj, _ = _find_object(uid, calendar_name)
-        if obj is None:
-            return False
-        new.uid = uid
-        _, ical = _build_ical(new)
-        obj.data = ical.decode()
-        obj.save()
-        return True
-    try:
-        return op()
-    except caldav.error.NotFoundError:
-        return False
-    except Exception:
-        _reset()
-        return op()
 
 
 def _parse_component(comp) -> dict:
@@ -247,73 +106,151 @@ def _parse_component(comp) -> dict:
         "notes": str(comp.get("description")) if comp.get("description") else None,
         "all_day": not isinstance(start, datetime),
         "reminders_minutes": reminders,
-        "calendar": None,  # проставляется в list_events / get_event
     }
 
 
-def get_event(uid: str, calendar_name: str | None = None) -> dict | None:
-    """Прочитать одно событие по UID целиком (с заметками и напоминаниями).
-
-    Нужно, чтобы правки (перенос/переименование/напоминания) не затирали
-    поля, которых нет в кратком списке из list_events.
-    """
-    def op():
-        obj, cname = _find_object(uid, calendar_name)
-        if obj is None:
-            return None
-        for comp in obj.icalendar_instance.walk("VEVENT"):
-            d = _parse_component(comp)
-            d["calendar"] = cname
-            return d
-        return None
-    try:
-        return op()
-    except caldav.error.NotFoundError:
-        return None
-    except Exception:
-        _reset()
-        return op()
+def _sort_key(start, tz):
+    if isinstance(start, datetime):
+        return start.astimezone(pytz.utc)
+    if isinstance(start, date):
+        return tz.localize(datetime.combine(start, datetime.min.time())).astimezone(pytz.utc)
+    return datetime.now(pytz.utc)
 
 
-def list_events(dt_from: datetime, dt_to: datetime) -> list[dict]:
-    """События в интервале по всем писабельным календарям, отсортированные по началу."""
-    def op():
-        out: list[dict] = []
-        for calendar in _writable_calendars():
-            try:
-                results = calendar.search(
-                    start=_aware(dt_from),
-                    end=_aware(dt_to),
-                    event=True,
-                    expand=True,
+# ---------- один пользователь = один аккаунт ----------
+
+class UserCalDAV:
+    def __init__(self, username: str, password: str,
+                 calendar_name: str | None = None, tz_name: str | None = None):
+        self.username = username
+        self.password = password
+        self.calendar_name = calendar_name
+        try:
+            self.tz = pytz.timezone(tz_name) if tz_name else DEFAULT_TZ
+        except Exception:
+            self.tz = DEFAULT_TZ
+        self._calendar = None  # кэш выбранного caldav.Calendar
+
+    # --- подключение ---
+
+    def _reset(self):
+        self._calendar = None
+
+    def _client(self) -> caldav.DAVClient:
+        return caldav.DAVClient(
+            url=config.CALDAV_URL,
+            username=self.username,
+            password=self.password,
+            timeout=30,
+        )
+
+    def _connect(self) -> "caldav.Calendar":
+        if self._calendar is not None:
+            return self._calendar
+        calendars = _writable(self._client().principal().calendars())
+        if not calendars:
+            raise RuntimeError("В iCloud не найдено календарей для событий (VEVENT).")
+        if self.calendar_name:
+            for c in calendars:
+                if (c.name or "").strip() == self.calendar_name:
+                    self._calendar = c
+                    break
+            if self._calendar is None:
+                names = ", ".join((c.name or "?") for c in calendars)
+                raise RuntimeError(
+                    f"Календарь '{self.calendar_name}' не найден. Доступны: {names}"
                 )
-            except Exception:
-                continue  # один капризный календарь не должен ронять всю выборку
-            cname = _cal_name(calendar)
-            for r in results:
-                for comp in r.icalendar_instance.walk("VEVENT"):
-                    d = _parse_component(comp)
-                    d["calendar"] = cname
-                    out.append(d)
+        else:
+            self._calendar = calendars[0]
+        return self._calendar
+
+    def _retry(self, op):
+        """Выполнить op; при сетевом сбое — переподключиться и повторить."""
+        try:
+            return op()
+        except caldav.error.NotFoundError:
+            raise
+        except Exception:
+            self._reset()
+            return op()
+
+    # --- публичное API ---
+
+    def list_calendar_names(self) -> list[str]:
+        return [c.name or "?" for c in _writable(self._client().principal().calendars())]
+
+    def create_event(self, ev: Event) -> str:
+        def op() -> str:
+            calendar = self._connect()
+            uid, ical = _build_ical(ev, self.tz)
+            calendar.save_event(ical.decode())
+            return uid
+        return self._retry(op)
+
+    def delete_event(self, uid: str) -> bool:
+        def op() -> bool:
+            calendar = self._connect()
+            try:
+                obj = calendar.event_by_uid(uid)
+            except caldav.error.NotFoundError:
+                return False
+            obj.delete()
+            return True
+        return self._retry(op)
+
+    def update_event(self, uid: str, new: Event) -> bool:
+        def op() -> bool:
+            calendar = self._connect()
+            try:
+                obj = calendar.event_by_uid(uid)
+            except caldav.error.NotFoundError:
+                return False
+            new.uid = uid
+            _, ical = _build_ical(new, self.tz)
+            obj.data = ical.decode()
+            obj.save()
+            return True
+        return self._retry(op)
+
+    def get_event(self, uid: str) -> dict | None:
+        """Прочитать одно событие целиком (с заметками и напоминаниями)."""
+        def op():
+            calendar = self._connect()
+            try:
+                obj = calendar.event_by_uid(uid)
+            except caldav.error.NotFoundError:
+                return None
+            for comp in obj.icalendar_instance.walk("VEVENT"):
+                return _parse_component(comp)
+            return None
+        return self._retry(op)
+
+    def list_events(self, dt_from: datetime, dt_to: datetime) -> list[dict]:
+        def op():
+            calendar = self._connect()
+            return calendar.search(
+                start=_aware(dt_from, self.tz),
+                end=_aware(dt_to, self.tz),
+                event=True,
+                expand=True,
+            )
+        results = self._retry(op)
+        out: list[dict] = []
+        for r in results:
+            for comp in r.icalendar_instance.walk("VEVENT"):
+                out.append(_parse_component(comp))
+        out.sort(key=lambda e: _sort_key(e["start"], self.tz))
         return out
-    try:
-        out = op()
-    except Exception:
-        _reset()
-        out = op()
-    out.sort(key=lambda e: _sort_key(e["start"]))
-    return out
 
-
-def find_by_title(title: str, dt_from: datetime, dt_to: datetime) -> list[dict]:
-    """Нечёткий поиск события по названию в интервале (для текстовых правок)."""
-    needle = title.lower().strip()
-    matches = []
-    for e in list_events(dt_from, dt_to):
-        t = e["title"].lower()
-        if needle in t or t in needle or _overlap(needle, t):
-            matches.append(e)
-    return matches
+    def find_by_title(self, title: str, dt_from: datetime, dt_to: datetime) -> list[dict]:
+        """Нечёткий поиск по названию (запасной путь для текстовых правок)."""
+        needle = title.lower().strip()
+        matches = []
+        for e in self.list_events(dt_from, dt_to):
+            t = e["title"].lower()
+            if needle in t or t in needle or _overlap(needle, t):
+                matches.append(e)
+        return matches
 
 
 def _overlap(a: str, b: str) -> bool:
@@ -321,9 +258,29 @@ def _overlap(a: str, b: str) -> bool:
     return len(aw & bw) >= 1 and (len(aw & bw) / max(1, min(len(aw), len(bw)))) >= 0.5
 
 
-def _sort_key(start):
-    if isinstance(start, datetime):
-        return start.astimezone(pytz.utc)
-    if isinstance(start, date):
-        return TZ.localize(datetime.combine(start, datetime.min.time())).astimezone(pytz.utc)
-    return datetime.now(pytz.utc)
+# ---------- кэш инстансов ----------
+
+_instances: dict[int, UserCalDAV] = {}
+
+
+def for_user(user_id: int) -> UserCalDAV:
+    """Клиент календаря конкретного пользователя. RuntimeError, если Apple ID не подключён."""
+    u = store.get_user(user_id)
+    if not u or not u.get("icloud_username"):
+        raise RuntimeError("Apple ID не подключён — открой ⚙️ Настройки.")
+    inst = _instances.get(user_id)
+    if inst and inst.username == u["icloud_username"] and inst.calendar_name == u.get("calendar_name"):
+        return inst
+    inst = UserCalDAV(
+        u["icloud_username"],
+        security.decrypt(u["icloud_password"]),
+        u.get("calendar_name"),
+        u.get("timezone"),
+    )
+    _instances[user_id] = inst
+    return inst
+
+
+def drop(user_id: int):
+    """Сбросить кэш (смена кредов / календаря / пояса / удаление аккаунта)."""
+    _instances.pop(user_id, None)
