@@ -22,6 +22,11 @@ DEFAULT_TZ = pytz.timezone(config.TIMEZONE)
 
 # ---------- общие помощники ----------
 
+def _norm_name(name) -> str:
+    """Имя календаря без хвостовых пробелов/NBSP — iCloud их сохраняет как есть."""
+    return (name or "").replace("\u00a0", " ").strip()
+
+
 def _writable(calendars) -> list:
     """Только календари, принимающие VEVENT (не Reminders/Birthdays)."""
     out = []
@@ -39,7 +44,7 @@ def test_connection(username: str, password: str) -> list[str]:
     client = caldav.DAVClient(
         url=config.CALDAV_URL, username=username, password=password, timeout=30,
     )
-    return [c.name or "?" for c in _writable(client.principal().calendars())]
+    return [_norm_name(c.name) or "?" for c in _writable(client.principal().calendars())]
 
 
 def _aware(dt: datetime, tz) -> datetime:
@@ -151,12 +156,18 @@ class UserCalDAV:
         if not calendars:
             raise RuntimeError("В iCloud не найдено календарей для событий (VEVENT).")
         if self.calendar_name:
-            for c in calendars:
-                if (c.name or "").strip() == self.calendar_name:
+            want = _norm_name(self.calendar_name)
+            for c in calendars:                       # точное совпадение
+                if _norm_name(c.name) == want:
                     self._calendar = c
                     break
+            else:
+                for c in calendars:                   # без учёта регистра
+                    if _norm_name(c.name).casefold() == want.casefold():
+                        self._calendar = c
+                        break
             if self._calendar is None:
-                names = ", ".join((c.name or "?") for c in calendars)
+                names = ", ".join(_norm_name(c.name) or "?" for c in calendars)
                 raise RuntimeError(
                     f"Календарь '{self.calendar_name}' не найден. Доступны: {names}"
                 )
@@ -177,7 +188,8 @@ class UserCalDAV:
     # --- публичное API ---
 
     def list_calendar_names(self) -> list[str]:
-        return [c.name or "?" for c in _writable(self._client().principal().calendars())]
+        return [_norm_name(c.name) or "?"
+                for c in _writable(self._client().principal().calendars())]
 
     def create_event(self, ev: Event) -> str:
         def op() -> str:
