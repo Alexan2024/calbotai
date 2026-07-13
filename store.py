@@ -73,7 +73,8 @@ def set_credentials(user_id: int, icloud_username: str, icloud_password_enc: str
 
 
 def set_calendar(user_id: int, calendar_name: str):
-    _conn.execute("UPDATE users SET calendar_name=? WHERE user_id=?", (calendar_name, user_id))
+    name = (calendar_name or "").replace("\u00a0", " ").strip() or None
+    _conn.execute("UPDATE users SET calendar_name=? WHERE user_id=?", (name, user_id))
     _conn.commit()
 
 
