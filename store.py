@@ -1,11 +1,8 @@
-"""Лёгкое хранилище созданных ботом событий (SQLite).
+"""Хранилище (SQLite): пользователи бота и созданные события.
 
-Нужно для двух вещей:
-  1) находить недавно созданные события для правок;
-  2) слать напоминания в Telegram (если включено).
-
-Также запоминаем, в какой календарь записано событие, чтобы правки/удаление
-шли сразу в нужный календарь, а не перебирали все.
+users  — доступ (pending/approved/blocked), Apple ID + шифрованный пароль
+         приложения, выбранный календарь, часовой пояс.
+events — созданные ботом события: для правок и пинг-напоминаний в Telegram.
 """
 import sqlite3
 from datetime import datetime
@@ -19,27 +16,96 @@ CREATE TABLE IF NOT EXISTS events (
     chat_id    INTEGER NOT NULL,
     title      TEXT NOT NULL,
     start_iso  TEXT NOT NULL,
-    calendar   TEXT,
     reminded   INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 )
 """)
+_conn.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id         INTEGER PRIMARY KEY,
+    tg_name         TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending',   -- pending | approved | blocked
+    icloud_username TEXT,
+    icloud_password TEXT,                              -- зашифровано (security.py)
+    calendar_name   TEXT,
+    timezone        TEXT,
+    created_at      TEXT NOT NULL
+)
+""")
 _conn.commit()
 
-# Миграция для старых БД, созданных до появления колонки calendar.
-try:
-    _conn.execute("ALTER TABLE events ADD COLUMN calendar TEXT")
-    _conn.commit()
-except sqlite3.OperationalError:
-    pass  # колонка уже есть
+_USER_KEYS = [
+    "user_id", "tg_name", "status", "icloud_username", "icloud_password",
+    "calendar_name", "timezone", "created_at",
+]
+_USER_COLS = ", ".join(_USER_KEYS)
 
 
-def add(uid: str, chat_id: int, title: str, start: datetime, calendar: str | None = None):
+# ---------- пользователи ----------
+
+def get_user(user_id: int) -> dict | None:
+    row = _conn.execute(
+        f"SELECT {_USER_COLS} FROM users WHERE user_id=?", (user_id,)
+    ).fetchone()
+    return dict(zip(_USER_KEYS, row)) if row else None
+
+
+def create_user(user_id: int, tg_name: str, status: str = "pending"):
     _conn.execute(
-        "INSERT OR REPLACE INTO events "
-        "(uid, chat_id, title, start_iso, calendar, reminded, created_at) "
-        "VALUES (?,?,?,?,?,COALESCE((SELECT reminded FROM events WHERE uid=?),0),?)",
-        (uid, chat_id, title, start.isoformat(), calendar, uid, datetime.now().isoformat()),
+        "INSERT OR IGNORE INTO users (user_id, tg_name, status, created_at) VALUES (?,?,?,?)",
+        (user_id, tg_name, status, datetime.now().isoformat()),
+    )
+    _conn.execute("UPDATE users SET tg_name=? WHERE user_id=?", (tg_name, user_id))
+    _conn.commit()
+
+
+def set_status(user_id: int, status: str):
+    _conn.execute("UPDATE users SET status=? WHERE user_id=?", (status, user_id))
+    _conn.commit()
+
+
+def set_credentials(user_id: int, icloud_username: str, icloud_password_enc: str):
+    _conn.execute(
+        "UPDATE users SET icloud_username=?, icloud_password=?, calendar_name=NULL WHERE user_id=?",
+        (icloud_username, icloud_password_enc, user_id),
+    )
+    _conn.commit()
+
+
+def set_calendar(user_id: int, calendar_name: str):
+    _conn.execute("UPDATE users SET calendar_name=? WHERE user_id=?", (calendar_name, user_id))
+    _conn.commit()
+
+
+def set_timezone(user_id: int, tz_name: str):
+    _conn.execute("UPDATE users SET timezone=? WHERE user_id=?", (tz_name, user_id))
+    _conn.commit()
+
+
+def delete_user(user_id: int):
+    _conn.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+    _conn.commit()
+
+
+def list_users() -> list[dict]:
+    rows = _conn.execute(
+        f"SELECT {_USER_COLS} FROM users ORDER BY created_at"
+    ).fetchall()
+    return [dict(zip(_USER_KEYS, r)) for r in rows]
+
+
+def remove_user_events(chat_id: int):
+    _conn.execute("DELETE FROM events WHERE chat_id=?", (chat_id,))
+    _conn.commit()
+
+
+# ---------- события ----------
+
+def add(uid: str, chat_id: int, title: str, start: datetime):
+    _conn.execute(
+        "INSERT OR REPLACE INTO events (uid, chat_id, title, start_iso, reminded, created_at) "
+        "VALUES (?,?,?,?,COALESCE((SELECT reminded FROM events WHERE uid=?),0),?)",
+        (uid, chat_id, title, start.isoformat(), uid, datetime.now().isoformat()),
     )
     _conn.commit()
 
@@ -55,12 +121,6 @@ def update_start(uid: str, title: str, start: datetime):
         (title, start.isoformat(), uid),
     )
     _conn.commit()
-
-
-def get_calendar(uid: str) -> str | None:
-    """Имя календаря, в который записано событие (или None, если неизвестно)."""
-    row = _conn.execute("SELECT calendar FROM events WHERE uid=?", (uid,)).fetchone()
-    return row[0] if row else None
 
 
 def due_for_reminder(within_seconds: int) -> list[tuple[str, int, str, str]]:
