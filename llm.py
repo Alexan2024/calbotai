@@ -6,10 +6,13 @@
 
 Возвращает JSON:
 {
-  "intent": "create" | "edit" | "query" | "chitchat",
-  "events": [ {title, category, start, end, all_day, location, notes, reminders_minutes} ],
+  "intent": "create" | "edit" | "query" | "find_slot" | "bulk" | "chitchat",
+  "events": [ {title, category, start, end, all_day, location, notes,
+               reminders_minutes, recurrence} ],
   "query": {"from": ISO, "to": ISO} | null,
   "edit": {"match_title": str, "changes": {...}} | null,
+  "slot": {"title", "duration_minutes", "from", "to"} | null,
+  "bulk": {"op", "from", "to", "match_title", "shift_minutes"} | null,
   "reply": "строка или null"
 }
 
@@ -41,7 +44,7 @@ def _system_prompt(now: datetime, tz: str) -> str:
 
 Верни СТРОГО один JSON-объект без markdown и без пояснений, со схемой:
 {{
-  "intent": "create" | "edit" | "query" | "chitchat",
+  "intent": "create" | "edit" | "query" | "find_slot" | "bulk" | "chitchat",
   "events": [
     {{
       "title": "строка",
@@ -51,11 +54,16 @@ def _system_prompt(now: datetime, tz: str) -> str:
       "all_day": true|false,
       "location": "строка или null",
       "notes": "строка или null",
-      "reminders_minutes": [числа минут до начала]
+      "reminders_minutes": [числа минут до начала],
+      "recurrence": "RRULE-строка или null"
     }}
   ],
   "query": {{"from": "ISO", "to": "ISO"}} | null,
   "edit": {{"match_title": "строка", "changes": {{ поля события }}}} | null,
+  "slot": {{"title": "строка или null", "duration_minutes": число,
+            "from": "ISO или null", "to": "ISO или null"}} | null,
+  "bulk": {{"op": "delete" | "shift", "from": "ISO", "to": "ISO",
+            "match_title": "строка или null", "shift_minutes": число или null}} | null,
   "reply": "строка или null"
 }}
 
@@ -63,9 +71,28 @@ def _system_prompt(now: datetime, tz: str) -> str:
 - intent=create — если пользователь описывает событие/встречу/дедлайн/афишу.
 - intent=query — если спрашивает про расписание («что у меня завтра», «планы на неделю»).
   Заполни query.from и query.to границами периода; events оставь пустым.
-- intent=edit — если просит изменить/перенести/удалить уже существующее событие.
+- intent=edit — если просит изменить/перенести/удалить ОДНО конкретное событие.
   В edit.match_title — как назвать искомое событие; в edit.changes — новые значения.
+- intent=find_slot — если просит найти свободное время («найди час на этой неделе
+  для встречи», «когда я свободен завтра на 30 минут»). duration_minutes — длительность
+  (по умолчанию 60), from/to — границы поиска (null = ближайшая неделя),
+  title — как назвать событие, если понятно из фразы.
+- intent=bulk — если просит изменить сразу МНОГО событий: «отмени всё в пятницу»,
+  «перенеси все созвоны завтра на час позже». op=delete — удалить, op=shift — сдвинуть
+  на shift_minutes минут (может быть отрицательным). from/to — границы периода.
+  match_title — фильтр по названию (null = все события периода).
 - intent=chitchat — если это не про календарь; дай короткий ответ в reply.
+
+Правило recurrence — заполняй ТОЛЬКО если пользователь явно описал повторение
+(«каждый вторник», «ежемесячно», «раз в год», «по будням»):
+- Формат — валидная RRULE-строка без префикса "RRULE:", например:
+  «каждый вторник» → "FREQ=WEEKLY;BYDAY=TU"
+  «по будням в 9» → "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"
+  «1-го числа каждого месяца» → "FREQ=MONTHLY;BYMONTHDAY=1"
+  «раз в год» → "FREQ=YEARLY"
+  «каждые 2 недели» → "FREQ=WEEKLY;INTERVAL=2"
+- start при этом — первое вхождение события.
+- Если повторение не упомянуто — recurrence=null. Дни рождения бот сам делает ежегодными.
 
 Правила названий (title) — это тон-оф-войс, соблюдай строго:
 - Естественная короткая фраза, 2–5 слов: «Приём у врача», «Созвон с командой», «Дедлайн по отчёту».
