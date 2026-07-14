@@ -13,6 +13,7 @@ class Event:
     location: str | None = None
     notes: str | None = None
     reminders_minutes: list[int] = field(default_factory=list)
+    recurrence: str | None = None  # RRULE-строка, например "FREQ=WEEKLY;BYDAY=TU"
     uid: str | None = None        # заполняется после записи в CalDAV
 
     def to_dict(self) -> dict:
@@ -31,5 +32,6 @@ class Event:
             location=d.get("location"),
             notes=d.get("notes"),
             reminders_minutes=d.get("reminders_minutes", []),
+            recurrence=d.get("recurrence"),
             uid=d.get("uid"),
         )
