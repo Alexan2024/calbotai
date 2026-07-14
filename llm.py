@@ -4,6 +4,14 @@
 текст и изображения, поэтому и разбор текста, и распознавание афиш идут здесь.
 Аудио Claude не принимает — голос расшифровывается отдельно (см. transcribe.py).
 
+Производительность:
+- системный промпт разбит на два блока: статический (кэшируется, cache_control)
+  и динамический («текущий момент»). Раньше время было вшито в начало промпта,
+  из-за чего префикс менялся каждый вызов и prompt cache не срабатывал никогда.
+- «текущий момент» округляется до минуты — иначе кэш промахивался бы на каждом
+  запросе даже при разделении блоков.
+- parse_when (разбор «завтра в 15:00») гоняется на быстрой модели LLM_MODEL_FAST.
+
 Возвращает JSON:
 {
   "intent": "create" | "edit" | "query" | "find_slot" | "bulk" | "chitchat",
@@ -23,6 +31,7 @@
 from __future__ import annotations
 import base64
 import json
+import time
 from datetime import datetime
 
 from anthropic import AsyncAnthropic
@@ -32,21 +41,22 @@ import config
 client = AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
 
 
-def _system_prompt(now: datetime, tz: str) -> str:
-    return f"""Ты — движок разбора для календарного ассистента. По сообщению пользователя
+# ---------- статический системный промпт (кэшируется) ----------
+
+STATIC_SYSTEM = """Ты — движок разбора для календарного ассистента. По сообщению пользователя
 определи намерение и извлеки данные о событии(ях). Пользователь пишет на русском или
 английском, в свободной форме: текст, пересланное сообщение, распознанный текст с афиши,
 расшифровка голосового.
 
-Текущий момент: {now.isoformat()} (часовой пояс {tz}).
+Текущий момент и часовой пояс пользователя даны отдельным блоком ниже.
 Все относительные даты («завтра», «в пятницу», «через час», «сегодня вечером»)
 считай от текущего момента и возвращай абсолютными в ISO 8601 с оффсетом пояса.
 
 Верни СТРОГО один JSON-объект без markdown и без пояснений, со схемой:
-{{
+{
   "intent": "create" | "edit" | "query" | "find_slot" | "bulk" | "chitchat",
   "events": [
-    {{
+    {
       "title": "строка",
       "category": "health|sport|call_online|meeting|call|deadline|birthday|travel|food|event|study|service|other",
       "start": "ISO 8601 с оффсетом",
@@ -56,16 +66,16 @@ def _system_prompt(now: datetime, tz: str) -> str:
       "notes": "строка или null",
       "reminders_minutes": [числа минут до начала],
       "recurrence": "RRULE-строка или null"
-    }}
+    }
   ],
-  "query": {{"from": "ISO", "to": "ISO"}} | null,
-  "edit": {{"match_title": "строка", "changes": {{ поля события }}}} | null,
-  "slot": {{"title": "строка или null", "duration_minutes": число,
-            "from": "ISO или null", "to": "ISO или null"}} | null,
-  "bulk": {{"op": "delete" | "shift", "from": "ISO", "to": "ISO",
-            "match_title": "строка или null", "shift_minutes": число или null}} | null,
+  "query": {"from": "ISO", "to": "ISO"} | null,
+  "edit": {"match_title": "строка", "changes": { поля события }} | null,
+  "slot": {"title": "строка или null", "duration_minutes": число,
+           "from": "ISO или null", "to": "ISO или null"} | null,
+  "bulk": {"op": "delete" | "shift", "from": "ISO", "to": "ISO",
+           "match_title": "строка или null", "shift_minutes": число или null} | null,
   "reply": "строка или null"
-}}
+}
 
 Правила намерений:
 - intent=create — если пользователь описывает событие/встречу/дедлайн/афишу.
@@ -125,20 +135,48 @@ def _system_prompt(now: datetime, tz: str) -> str:
 - Если конца нет — оставь end=null (длительность подставит бот).
 - reminders_minutes оставляй пустым, если пользователь явно не просил напоминание.
 - Может быть несколько событий — верни их все.
-- Если пользователь задает вопрос про его планы, занятость и тд - анализируй и отвечай
+- Если пользователь задаёт вопрос про его планы, занятость и т.д. — анализируй и отвечай.
 """
 
-
-def _when_prompt(now: datetime, tz: str) -> str:
-    return f"""Ты извлекаешь дату и время из короткой фразы пользователя для переноса
-уже существующего события. Текущий момент: {now.isoformat()} (часовой пояс {tz}).
+WHEN_SYSTEM = """Ты извлекаешь дату и время из короткой фразы пользователя для переноса
+уже существующего события. Текущий момент и часовой пояс даны отдельным блоком ниже.
 Относительные даты считай от текущего момента, возвращай абсолютными в ISO 8601 с оффсетом.
 
 Верни СТРОГО один JSON-объект без markdown:
-{{"start": "ISO 8601", "end": "ISO 8601 или null", "all_day": true|false}}
+{"start": "ISO 8601", "end": "ISO 8601 или null", "all_day": true|false}
 
 Если названо только время без даты — возьми ближайшую подходящую дату (сегодня, если
 время ещё не прошло, иначе завтра). Если названа только дата без времени — all_day=true."""
+
+
+def _now_block(now: datetime, tz: str) -> dict:
+    # округление до минуты: иначе динамический блок менялся бы каждую секунду
+    stamp = now.replace(second=0, microsecond=0).isoformat()
+    return {
+        "type": "text",
+        "text": f"Текущий момент: {stamp} (часовой пояс {tz}).",
+    }
+
+
+def _system_blocks(static: str, now: datetime, tz: str, cacheable: bool) -> list[dict]:
+    head: dict = {"type": "text", "text": static}
+    if cacheable and config.LLM_CACHE:
+        head["cache_control"] = {"type": "ephemeral"}
+    return [head, _now_block(now, tz)]
+
+
+def _perf(label: str, t0: float, resp=None):
+    if not config.PERF_LOG:
+        return
+    ms = (time.perf_counter() - t0) * 1000
+    extra = ""
+    u = getattr(resp, "usage", None)
+    if u is not None:
+        extra = (f" in={getattr(u, 'input_tokens', '?')}"
+                 f" cache_r={getattr(u, 'cache_read_input_tokens', 0)}"
+                 f" cache_w={getattr(u, 'cache_creation_input_tokens', 0)}"
+                 f" out={getattr(u, 'output_tokens', '?')}")
+    print(f"[perf] llm {label}: {ms:.0f} ms{extra}", flush=True)
 
 
 def _extract_json(resp) -> dict:
@@ -156,18 +194,24 @@ def _extract_json(resp) -> dict:
     return json.loads(text)
 
 
-async def _ask(system: str, user_content) -> dict:
+async def _ask(system_blocks: list[dict], user_content, model: str,
+               max_tokens: int, label: str) -> dict:
+    t0 = time.perf_counter()
     resp = await client.messages.create(
-        model=config.LLM_MODEL,
-        max_tokens=2000,
-        system=system,
+        model=model,
+        max_tokens=max_tokens,
+        system=system_blocks,
         messages=[{"role": "user", "content": user_content}],
     )
+    _perf(label, t0, resp)
     return _extract_json(resp)
 
 
 async def parse_text(text: str, now: datetime, tz: str) -> dict:
-    return await _ask(_system_prompt(now, tz), text)
+    return await _ask(
+        _system_blocks(STATIC_SYSTEM, now, tz, cacheable=True),
+        text, config.LLM_MODEL, config.LLM_MAX_TOKENS, "parse_text",
+    )
 
 
 async def parse_image(image_bytes: bytes, caption: str, now: datetime, tz: str) -> dict:
@@ -180,9 +224,19 @@ async def parse_image(image_bytes: bytes, caption: str, now: datetime, tz: str) 
             "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
         },
     ]
-    return await _ask(_system_prompt(now, tz), user_content)
+    return await _ask(
+        _system_blocks(STATIC_SYSTEM, now, tz, cacheable=True),
+        user_content, config.LLM_MODEL, config.LLM_MAX_TOKENS, "parse_image",
+    )
 
 
 async def parse_when(text: str, now: datetime, tz: str) -> dict:
-    """Разобрать «на завтра в 15:00» → {start, end, all_day} для ручного переноса."""
-    return await _ask(_when_prompt(now, tz), text)
+    """Разобрать «на завтра в 15:00» → {start, end, all_day} для ручного переноса.
+
+    Задача мелкая — гоняем на быстрой модели (LLM_MODEL_FAST). Промпт короткий,
+    кэшировать его смысла нет (ниже минимального размера кэш-блока).
+    """
+    return await _ask(
+        _system_blocks(WHEN_SYSTEM, now, tz, cacheable=False),
+        text, config.LLM_MODEL_FAST, 300, "parse_when",
+    )
