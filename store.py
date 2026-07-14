@@ -1,8 +1,8 @@
 """Хранилище (SQLite): пользователи бота и созданные события.
 
 users  — доступ (pending/approved/blocked), Apple ID + шифрованный пароль
-         приложения, выбранный календарь, часовой пояс.
-events — созданные ботом события: для правок и пинг-напоминаний в Telegram.
+         приложения, выбранный календарь, часовой пояс, настройки дайджеста.
+events — созданные ботом события: для правок, пинг-напоминаний и снуза.
 """
 import sqlite3
 from datetime import datetime
@@ -34,9 +34,23 @@ CREATE TABLE IF NOT EXISTS users (
 """)
 _conn.commit()
 
+
+def _ensure_column(table: str, col: str, decl: str):
+    """Авто-миграция: добавить колонку, если её ещё нет."""
+    cols = [r[1] for r in _conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if col not in cols:
+        _conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        _conn.commit()
+
+
+_ensure_column("events", "calendar", "TEXT")                              # где лежит событие
+_ensure_column("events", "snooze_iso", "TEXT")                            # «напомнить ещё раз в …»
+_ensure_column("users", "digest_enabled", "INTEGER NOT NULL DEFAULT 1")   # утренний дайджест
+_ensure_column("users", "last_digest_date", "TEXT")                       # защита от повторной отправки
+
 _USER_KEYS = [
     "user_id", "tg_name", "status", "icloud_username", "icloud_password",
-    "calendar_name", "timezone", "created_at",
+    "calendar_name", "timezone", "created_at", "digest_enabled", "last_digest_date",
 ]
 _USER_COLS = ", ".join(_USER_KEYS)
 
@@ -83,6 +97,30 @@ def set_timezone(user_id: int, tz_name: str):
     _conn.commit()
 
 
+def set_digest(user_id: int, enabled: bool):
+    _conn.execute(
+        "UPDATE users SET digest_enabled=? WHERE user_id=?",
+        (1 if enabled else 0, user_id),
+    )
+    _conn.commit()
+
+
+def mark_digest_sent(user_id: int, date_str: str):
+    _conn.execute(
+        "UPDATE users SET last_digest_date=? WHERE user_id=?", (date_str, user_id)
+    )
+    _conn.commit()
+
+
+def users_for_digest() -> list[dict]:
+    """Одобренные пользователи с подключённым Apple ID и включённым дайджестом."""
+    rows = _conn.execute(
+        f"SELECT {_USER_COLS} FROM users "
+        "WHERE status='approved' AND icloud_username IS NOT NULL AND digest_enabled=1"
+    ).fetchall()
+    return [dict(zip(_USER_KEYS, r)) for r in rows]
+
+
 def delete_user(user_id: int):
     _conn.execute("DELETE FROM users WHERE user_id=?", (user_id,))
     _conn.commit()
@@ -102,11 +140,11 @@ def remove_user_events(chat_id: int):
 
 # ---------- события ----------
 
-def add(uid: str, chat_id: int, title: str, start: datetime):
+def add(uid: str, chat_id: int, title: str, start: datetime, calendar: str | None = None):
     _conn.execute(
-        "INSERT OR REPLACE INTO events (uid, chat_id, title, start_iso, reminded, created_at) "
-        "VALUES (?,?,?,?,COALESCE((SELECT reminded FROM events WHERE uid=?),0),?)",
-        (uid, chat_id, title, start.isoformat(), uid, datetime.now().isoformat()),
+        "INSERT OR REPLACE INTO events (uid, chat_id, title, start_iso, reminded, created_at, calendar) "
+        "VALUES (?,?,?,?,COALESCE((SELECT reminded FROM events WHERE uid=?),0),?,?)",
+        (uid, chat_id, title, start.isoformat(), uid, datetime.now().isoformat(), calendar),
     )
     _conn.commit()
 
@@ -118,20 +156,43 @@ def remove(uid: str):
 
 def update_start(uid: str, title: str, start: datetime):
     _conn.execute(
-        "UPDATE events SET title=?, start_iso=?, reminded=0 WHERE uid=?",
+        "UPDATE events SET title=?, start_iso=?, reminded=0, snooze_iso=NULL WHERE uid=?",
         (title, start.isoformat(), uid),
     )
     _conn.commit()
 
 
+def get_event_calendar(uid: str) -> str | None:
+    row = _conn.execute("SELECT calendar FROM events WHERE uid=?", (uid,)).fetchone()
+    return row[0] if row else None
+
+
+def set_snooze(uid: str, snooze_iso: str):
+    """Отложить пинг: снова напомнить в указанный момент."""
+    _conn.execute(
+        "UPDATE events SET reminded=0, snooze_iso=? WHERE uid=?", (snooze_iso, uid)
+    )
+    _conn.commit()
+
+
 def due_for_reminder(within_seconds: int) -> list[tuple[str, int, str, str]]:
-    """События, начинающиеся в ближайшие within_seconds и ещё не напомненные."""
+    """События к напоминанию: обычные (скоро начнутся) и отложенные (снуз наступил)."""
     now = datetime.now().astimezone()
     rows = _conn.execute(
-        "SELECT uid, chat_id, title, start_iso FROM events WHERE reminded=0"
+        "SELECT uid, chat_id, title, start_iso, snooze_iso FROM events WHERE reminded=0"
     ).fetchall()
     due = []
-    for uid, chat_id, title, start_iso in rows:
+    for uid, chat_id, title, start_iso, snooze_iso in rows:
+        if snooze_iso:
+            try:
+                snooze = datetime.fromisoformat(snooze_iso)
+            except ValueError:
+                continue
+            if snooze.tzinfo is None:
+                snooze = snooze.astimezone()
+            if now >= snooze:
+                due.append((uid, chat_id, title, start_iso))
+            continue
         try:
             start = datetime.fromisoformat(start_iso)
         except ValueError:
@@ -145,5 +206,5 @@ def due_for_reminder(within_seconds: int) -> list[tuple[str, int, str, str]]:
 
 
 def mark_reminded(uid: str):
-    _conn.execute("UPDATE events SET reminded=1 WHERE uid=?", (uid,))
+    _conn.execute("UPDATE events SET reminded=1, snooze_iso=NULL WHERE uid=?", (uid,))
     _conn.commit()
