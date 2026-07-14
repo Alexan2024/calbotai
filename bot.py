@@ -2,11 +2,17 @@
 
 Мультипользовательский: новые пользователи запрашивают доступ, владелец
 подтверждает кнопкой, дальше каждый подключает СВОЙ Apple ID (пароль
-приложения) и работает со своим календарём. Креды шифруются (security.py).
+приложения) и работает со своими календарями. Креды шифруются (security.py).
 
-UX кнопочный: постоянная reply-клавиатура (Сегодня/Неделя/Месяц/Напоминания/
-Настройки), инлайн-навигация по дням, тапабельные события с действиями.
-Правки идут по UID события; текстовый разбор («перенеси врача») — запасной путь.
+UX кнопочный: постоянная reply-клавиатура, инлайн-навигация по дням,
+тапабельные события с действиями. Правки идут по UID (+ имя календаря);
+текстовый разбор («перенеси врача») — запасной путь.
+
+Новое: выбор календаря прямо в карточке создания; чтение (день/неделя/месяц/
+напоминания/дайджест/статистика) идёт по ВСЕМ календарям; повторяющиеся
+события (RRULE); утренний дайджест; кнопки на пинге напоминания (+15 мин /
+карточка); детектор пересечений; поиск свободного слота; undo после создания;
+массовые операции («отмени всё в пятницу»); статистика за неделю.
 """
 from __future__ import annotations
 import asyncio
@@ -47,22 +53,41 @@ CATEGORY_EMOJI = {
     "call": "📞", "deadline": "⏰", "birthday": "🎂", "travel": "✈️",
     "food": "🍽", "event": "🎫", "study": "📚", "service": "💇", "other": "📌",
 }
+CATEGORY_LABEL = {
+    "health": "здоровье", "sport": "спорт", "call_online": "созвоны",
+    "meeting": "встречи", "call": "звонки", "deadline": "дедлайны",
+    "birthday": "дни рождения", "travel": "поездки", "food": "еда",
+    "event": "мероприятия", "study": "учёба", "service": "услуги",
+    "other": "прочее",
+}
+EMOJI_TO_CATEGORY = {v: k for k, v in CATEGORY_EMOJI.items()}
 
 REMINDER_PRESETS = [10, 60, 1440]  # 10 мин, 1 час, 1 день
 
 STATUS_ICON = {"approved": "✅", "pending": "🕓", "blocked": "⛔"}
 
+RRULE_FREQ_LABEL = {
+    "YEARLY": "ежегодно", "MONTHLY": "ежемесячно",
+    "WEEKLY": "еженедельно", "DAILY": "ежедневно",
+}
+
 # --- состояние в памяти ---
-# подтверждения создания/правки: token -> {"action","event","user_id","chat_id",...}
+# подтверждения создания/правки/bulk: token -> {"action","event",...}
 PENDING: dict[str, dict] = {}
-# тапнутые события календаря: token -> {"uid","offset"}
+# тапнутые события календаря: token -> {"uid","offset","cal"}
 EVENTS: dict[str, dict] = {}
 # рабочий набор напоминаний в меню существующего события: token -> set(minutes)
 REMWORK: dict[str, set] = {}
 # ожидание текстового ввода: user_id -> {"mode",...}
 AWAITING: dict[int, dict] = {}
-# визард подключения: user_id -> список имён календарей на выбор
+# визард подключения / выбор календаря в настройках: user_id -> список имён
 SETUP: dict[int, list[str]] = {}
+# выбор календаря в карточке создания: token -> список имён
+CALPICK: dict[str, list[str]] = {}
+# найденные свободные слоты: token -> {"title","dur","slots":[iso]}
+SLOTS: dict[str, dict] = {}
+# undo после создания: token -> {"uid","cal"}
+UNDO: dict[str, dict] = {}
 
 
 # ---------- вспомогательное ----------
@@ -126,12 +151,28 @@ def rem_label(m: int) -> str:
     return f"{m} мин"
 
 
-def event_card(ev: Event, tz=None) -> str:
+def rec_label(rrule: str | None) -> str | None:
+    if not rrule:
+        return None
+    up = rrule.upper()
+    for freq, label in RRULE_FREQ_LABEL.items():
+        if f"FREQ={freq}" in up:
+            m = re.search(r"INTERVAL=(\d+)", up)
+            if m and int(m.group(1)) > 1:
+                return f"{label}, интервал {m.group(1)}"
+            return label
+    return "повторяется"
+
+
+def event_card(ev: Event, tz=None, cal_name: str | None = None) -> str:
     tz = tz or DEFAULT_TZ
     # эмодзи уже внутри ev.title (ставится при разборе), поэтому без ведущего 📌
     lines = [f"<b>{ev.title}</b>", f"🕒 {fmt_dt(ev.start, ev.all_day, tz)}"]
     if ev.end and not ev.all_day:
         lines[-1] += f" – {ev.end.astimezone(tz).strftime('%H:%M')}"
+    r = rec_label(ev.recurrence)
+    if r:
+        lines.append(f"🔁 {r}")
     if ev.location:
         lines.append(f"📍 {ev.location}")
     if ev.notes:
@@ -139,6 +180,8 @@ def event_card(ev: Event, tz=None) -> str:
     if ev.reminders_minutes:
         rem = ", ".join(rem_label(m) for m in ev.reminders_minutes)
         lines.append(f"🔔 {rem}")
+    if cal_name:
+        lines.append(f"📁 {cal_name}")
     return "\n".join(lines)
 
 
@@ -152,8 +195,13 @@ def event_from_llm(d: dict, tz) -> Event:
         if end.tzinfo is None:
             end = tz.localize(end)
     reminders = d.get("reminders_minutes") or list(config.DEFAULT_REMINDERS)
-    emoji = CATEGORY_EMOJI.get(d.get("category") or "other", "📌")
+    category = d.get("category") or "other"
+    emoji = CATEGORY_EMOJI.get(category, "📌")
     raw_title = (d.get("title") or "Событие").strip()
+    recurrence = (d.get("recurrence") or "").strip() or None
+    # дни рождения повторяются ежегодно, даже если пользователь не сказал
+    if category == "birthday" and not recurrence:
+        recurrence = "FREQ=YEARLY"
     return Event(
         title=f"{emoji} {raw_title}",
         start=start,
@@ -162,6 +210,7 @@ def event_from_llm(d: dict, tz) -> Event:
         location=d.get("location"),
         notes=d.get("notes"),
         reminders_minutes=reminders,
+        recurrence=recurrence,
     )
 
 
@@ -175,6 +224,7 @@ def event_from_caldav(d: dict, tz) -> Event:
         location=d.get("location"),
         notes=d.get("notes"),
         reminders_minutes=list(d.get("reminders_minutes") or []),
+        recurrence=d.get("recurrence"),
         uid=d["uid"],
     )
 
@@ -261,10 +311,14 @@ def reminder_toggle_row(active: set, prefix: str, token: str) -> list[InlineKeyb
     return row
 
 
-def create_confirm_kb(token: str, active: set) -> InlineKeyboardMarkup:
+def create_confirm_kb(token: str, active: set, cal_name: str | None = None) -> InlineKeyboardMarkup:
     rows = [
         reminder_toggle_row(active, "crt", token),
         [InlineKeyboardButton(text="✏️ Своё напоминание", callback_data=f"crc:{token}")],
+        [InlineKeyboardButton(
+            text=f"📁 {cal_name}"[:60] if cal_name else "📁 Календарь по умолчанию",
+            callback_data=f"crl:{token}",
+        )],
         [
             InlineKeyboardButton(text="✅ Добавить", callback_data=f"ok:{token}"),
             InlineKeyboardButton(text="❌ Отмена", callback_data=f"no:{token}"),
@@ -280,25 +334,54 @@ def edit_confirm_kb(token: str) -> InlineKeyboardMarkup:
     ]])
 
 
-# ---------- разбор результата LLM ----------
+async def _render_create_card(msg_target, token: str, tz, edit: bool = True):
+    """Перерисовать карточку подтверждения создания (после тоглов/выбора календаря)."""
+    data = PENDING.get(token)
+    if not data:
+        return
+    ev = Event.from_dict(data["event"])
+    text = (event_card(ev, tz, data.get("calendar"))
+            + data.get("warn", "") + "\n\nДобавить в календарь?")
+    kb = create_confirm_kb(token, set(ev.reminders_minutes), data.get("calendar"))
+    if edit:
+        await msg_target.edit_text(text, reply_markup=kb)
+    else:
+        await msg_target.answer(text, reply_markup=kb)
 
-async def _dup_warning(user_id: int, ev: Event, tz) -> str:
-    """Мягкая проверка на дубль: похожее название рядом по времени."""
+
+# ---------- проверка дублей и пересечений ----------
+
+async def _conflict_warning(user_id: int, ev: Event, tz) -> str:
+    """Дубль (то же название рядом) или пересечение по времени — по всем календарям."""
     client = client_or_none(user_id)
     if client is None:
         return ""
+    ev_end = ev.end or ev.start + timedelta(hours=1)
     try:
         lo = ev.start - timedelta(hours=1)
-        hi = (ev.end or ev.start + timedelta(hours=1)) + timedelta(hours=1)
+        hi = ev_end + timedelta(hours=1)
         nearby = await asyncio.to_thread(client.list_events, lo, hi)
     except Exception:
         return ""
     mine = _norm_title(ev.title)
+    warns = []
     for e in nearby:
         if mine and _norm_title(e["title"]) == mine:
-            return f"\n\n⚠️ Похожее событие уже есть: {fmt_dt(e['start'], e['all_day'], tz)}"
-    return ""
+            warns.append(f"⚠️ Похожее событие уже есть: {fmt_dt(e['start'], e['all_day'], tz)}")
+            continue
+        if ev.all_day or e["all_day"] or not isinstance(e["start"], datetime):
+            continue
+        e_start = _to_dt(e["start"], tz)
+        e_end = _to_dt(e["end"], tz) if e.get("end") else e_start + timedelta(hours=1)
+        if ev.start < e_end and e_start < ev_end:
+            span = f"{e_start.astimezone(tz).strftime('%H:%M')}–{e_end.astimezone(tz).strftime('%H:%M')}"
+            warns.append(f"⚠️ Пересекается с «{e['title']}» ({span})")
+    if not warns:
+        return ""
+    return "\n\n" + "\n".join(warns[:3])
 
+
+# ---------- разбор результата LLM ----------
 
 async def handle_parsed(message: Message, parsed: dict, u: dict):
     intent = parsed.get("intent", "chitchat")
@@ -312,9 +395,10 @@ async def handle_parsed(message: Message, parsed: dict, u: dict):
         for ed in events:
             ev = event_from_llm(ed, tz)
             token = new_token()
+            warn = await _conflict_warning(u["user_id"], ev, tz)
             PENDING[token] = {"action": "create", "event": ev.to_dict(),
-                              "user_id": u["user_id"], "chat_id": message.chat.id}
-            warn = await _dup_warning(u["user_id"], ev, tz)
+                              "user_id": u["user_id"], "chat_id": message.chat.id,
+                              "calendar": None, "warn": warn}
             await message.answer(
                 event_card(ev, tz) + warn + "\n\nДобавить в календарь?",
                 reply_markup=create_confirm_kb(token, set(ev.reminders_minutes)),
@@ -328,6 +412,12 @@ async def handle_parsed(message: Message, parsed: dict, u: dict):
 
     elif intent == "edit":
         await handle_edit(message, parsed.get("edit") or {}, u)
+
+    elif intent == "find_slot":
+        await handle_find_slot(message, parsed.get("slot") or {}, u)
+
+    elif intent == "bulk":
+        await handle_bulk(message, parsed.get("bulk") or {}, u)
 
     else:
         await message.answer(parsed.get("reply") or "Пришли событие текстом, голосом или афишей 🙂")
@@ -392,7 +482,7 @@ async def handle_edit(message: Message, edit: dict, u: dict):
         return
 
     target = matches[0]
-    base = await asyncio.to_thread(client.get_event, target["uid"]) or target
+    base = await asyncio.to_thread(client.get_event, target["uid"], target.get("calendar")) or target
     new = event_from_caldav(base, tz)
     if changes.get("title"):
         new.title = changes["title"]
@@ -409,12 +499,201 @@ async def handle_edit(message: Message, edit: dict, u: dict):
 
     token = new_token()
     PENDING[token] = {"action": "edit", "event": new.to_dict(),
-                      "uid": target["uid"], "user_id": u["user_id"],
-                      "chat_id": message.chat.id}
+                      "uid": target["uid"], "cal": target.get("calendar"),
+                      "user_id": u["user_id"], "chat_id": message.chat.id}
     await message.answer(
         "Изменить на:\n\n" + event_card(new, tz) + "\n\nПрименить?",
         reply_markup=edit_confirm_kb(token),
     )
+
+
+# ---------- поиск свободного слота ----------
+
+def _ceil_half_hour(dt: datetime) -> datetime:
+    dt = dt.replace(second=0, microsecond=0)
+    add = (30 - dt.minute % 30) % 30
+    return dt + timedelta(minutes=add)
+
+
+def _compute_free_slots(events: list[dict], dt_from: datetime, dt_to: datetime,
+                        duration_min: int, tz, limit: int = 6) -> list[datetime]:
+    """Свободные окна в рабочие часы (WORKDAY_START..WORKDAY_END) по всем календарям."""
+    dur = timedelta(minutes=duration_min)
+    busy = []
+    for e in events:
+        if e["all_day"] or not isinstance(e["start"], datetime):
+            continue
+        s = _to_dt(e["start"], tz)
+        en = _to_dt(e["end"], tz) if e.get("end") else s + timedelta(hours=1)
+        busy.append((s, en))
+    busy.sort()
+    merged: list[tuple[datetime, datetime]] = []
+    for s, en in busy:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], en))
+        else:
+            merged.append((s, en))
+
+    slots: list[datetime] = []
+    d0 = dt_from.astimezone(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    n_days = max(1, (dt_to.astimezone(tz) - d0).days + 1)
+    for i in range(n_days):
+        day = d0 + timedelta(days=i)
+        ws = day + timedelta(hours=config.WORKDAY_START)
+        we = day + timedelta(hours=config.WORKDAY_END)
+        cursor = _ceil_half_hour(max(ws, dt_from))
+        if cursor >= we:
+            continue
+        for s, en in merged:
+            if en <= cursor or s >= we:
+                continue
+            if s - cursor >= dur:
+                slots.append(cursor)
+                if len(slots) >= limit:
+                    return slots
+            cursor = _ceil_half_hour(max(cursor, en))
+        if we - cursor >= dur:
+            slots.append(cursor)
+            if len(slots) >= limit:
+                return slots
+    return slots
+
+
+async def handle_find_slot(message: Message, slot: dict, u: dict):
+    tz = user_tz(u["user_id"])
+    dur = int(slot.get("duration_minutes") or 60)
+    dt_from = _iso(slot.get("from"), tz) or now(tz)
+    dt_to = _iso(slot.get("to"), tz) or (dt_from + timedelta(days=7))
+    title = (slot.get("title") or "Встреча").strip()
+    try:
+        client = cal.for_user(u["user_id"])
+        events = await asyncio.to_thread(client.list_events, dt_from, dt_to)
+    except Exception as e:
+        await message.answer(f"⚠️ Не смог прочитать календарь: {e}")
+        return
+    free = _compute_free_slots(events, dt_from, dt_to, dur, tz)
+    if not free:
+        await message.answer(
+            f"Свободных окон на {rem_label(dur)} в этом периоде не нашёл 😕 "
+            "Попробуй расширить период."
+        )
+        return
+    token = new_token()
+    SLOTS[token] = {"title": title, "dur": dur,
+                    "slots": [s.isoformat() for s in free],
+                    "user_id": u["user_id"], "chat_id": message.chat.id}
+    rows = []
+    for i, s in enumerate(free):
+        rows.append([InlineKeyboardButton(
+            text=f"{s.strftime('%d.%m')} ({DAYS[s.weekday()]}) {s.strftime('%H:%M')}",
+            callback_data=f"slp:{token}:{i}",
+        )])
+    await message.answer(
+        f"🔍 Свободные окна на <b>{rem_label(dur)}</b> "
+        f"({dt_from.strftime('%d.%m')}–{dt_to.strftime('%d.%m')}).\n"
+        f"Тапни, чтобы создать «{title}»:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("slp:"))
+async def cb_slot_pick(cq: CallbackQuery):
+    _, token, idx = cq.data.split(":")
+    data = SLOTS.get(token)
+    if not data or int(idx) >= len(data["slots"]):
+        await cq.answer("Слоты устарели — попроси найти заново", show_alert=True)
+        return
+    tz = user_tz(cq.from_user.id)
+    start = datetime.fromisoformat(data["slots"][int(idx)])
+    ev = Event(
+        title=f"🤝 {data['title']}",
+        start=start,
+        end=start + timedelta(minutes=data["dur"]),
+        reminders_minutes=list(config.DEFAULT_REMINDERS),
+    )
+    tok = new_token()
+    PENDING[tok] = {"action": "create", "event": ev.to_dict(),
+                    "user_id": data["user_id"], "chat_id": data["chat_id"],
+                    "calendar": None, "warn": ""}
+    await cq.message.edit_text(
+        event_card(ev, tz) + "\n\nДобавить в календарь?",
+        reply_markup=create_confirm_kb(tok, set(ev.reminders_minutes)),
+    )
+    await cq.answer()
+
+
+# ---------- массовые операции ----------
+
+async def handle_bulk(message: Message, bulk: dict, u: dict):
+    tz = user_tz(u["user_id"])
+    op = bulk.get("op")
+    dt_from = _iso(bulk.get("from"), tz)
+    dt_to = _iso(bulk.get("to"), tz)
+    shift = int(bulk.get("shift_minutes") or 0)
+    if op not in ("delete", "shift") or not dt_from or not dt_to or (op == "shift" and not shift):
+        await message.answer("Не понял массовую операцию. Пример: «отмени всё в пятницу» "
+                             "или «перенеси все созвоны завтра на час позже».")
+        return
+    try:
+        client = cal.for_user(u["user_id"])
+        events = await asyncio.to_thread(client.list_events, dt_from, dt_to)
+    except Exception as e:
+        await message.answer(f"⚠️ Не смог прочитать календарь: {e}")
+        return
+    needle = (bulk.get("match_title") or "").lower().strip()
+    if needle:
+        events = [e for e in events if needle in e["title"].lower()]
+    if not events:
+        await message.answer("Под эти условия ничего не попало.")
+        return
+    events = events[:30]
+    items = [{"uid": e["uid"], "cal": e.get("calendar")} for e in events]
+    token = new_token()
+    PENDING[token] = {"action": "bulk", "op": op, "shift": shift, "items": items,
+                      "user_id": u["user_id"], "chat_id": message.chat.id}
+    verb = "🗑 Удалить" if op == "delete" else f"🕒 Сдвинуть на {rem_label(abs(shift))}" + (" назад" if shift < 0 else "")
+    lines = [f"• {fmt_dt(e['start'], e['all_day'], tz)} — {e['title']}" for e in events[:10]]
+    more = f"\n…и ещё {len(events) - 10}" if len(events) > 10 else ""
+    await message.answer(
+        f"{verb} — событий: <b>{len(events)}</b>\n\n" + "\n".join(lines) + more + "\n\nПрименить?",
+        reply_markup=edit_confirm_kb(token),
+    )
+
+
+async def _apply_bulk(cq: CallbackQuery, data: dict):
+    user_id = data["user_id"]
+    tz = user_tz(user_id)
+    client = cal.for_user(user_id)
+    op, shift = data["op"], data.get("shift", 0)
+    done, failed = 0, 0
+    for it in data["items"]:
+        try:
+            if op == "delete":
+                ok = await asyncio.to_thread(client.delete_event, it["uid"], it.get("cal"))
+                if ok:
+                    store.remove(it["uid"])
+            else:  # shift
+                ev_dict = await asyncio.to_thread(client.get_event, it["uid"], it.get("cal"))
+                if not ev_dict:
+                    failed += 1
+                    continue
+                ev = event_from_caldav(ev_dict, tz)
+                delta = timedelta(minutes=shift)
+                ev.start = _to_dt(ev.start, tz) + delta
+                if ev.end:
+                    ev.end = _to_dt(ev.end, tz) + delta
+                ok = await asyncio.to_thread(client.update_event, it["uid"], ev, it.get("cal"))
+                if ok:
+                    store.update_start(it["uid"], ev.title, ev.start)
+            done += 1 if ok else 0
+            failed += 0 if ok else 1
+        except Exception:
+            failed += 1
+    verb = "удалено" if op == "delete" else "перенесено"
+    text = f"✅ Готово: {verb} {done}"
+    if failed:
+        text += f", не получилось: {failed}"
+    await cq.message.edit_text(text)
 
 
 # ---------- дневная навигация ----------
@@ -462,7 +741,7 @@ async def render_day(offset: int, user_id: int) -> tuple[str, InlineKeyboardMark
         lines = [f"🗓 <b>{day_title(offset, tz)}</b>", "", "Тапни событие, чтобы изменить:"]
         for e in events:
             token = new_token()
-            EVENTS[token] = {"uid": e["uid"], "offset": offset}
+            EVENTS[token] = {"uid": e["uid"], "offset": offset, "cal": e.get("calendar")}
             when = (e["start"].astimezone(tz).strftime("%H:%M")
                     if isinstance(e["start"], datetime) and not e["all_day"] else "весь день")
             rows.append([InlineKeyboardButton(
@@ -498,6 +777,39 @@ async def render_month(message: Message, user_id: int):
     await message.answer("\n".join(lines))
 
 
+# ---------- статистика за неделю ----------
+
+async def build_stats(user_id: int) -> str:
+    tz = user_tz(user_id)
+    dt_to = now(tz)
+    dt_from = dt_to - timedelta(days=7)
+    client = cal.for_user(user_id)
+    events = await asyncio.to_thread(client.list_events, dt_from, dt_to)
+    if not events:
+        return "📊 За последние 7 дней событий не было."
+    agg: dict[str, list[float]] = {}  # category -> [count, hours]
+    for e in events:
+        first = (e["title"] or "").split(" ")[0]
+        category = EMOJI_TO_CATEGORY.get(first, "other")
+        hours = 0.0
+        if isinstance(e["start"], datetime) and not e["all_day"]:
+            s = _to_dt(e["start"], tz)
+            en = _to_dt(e["end"], tz) if e.get("end") else s + timedelta(hours=1)
+            hours = max(0.0, (en - s).total_seconds() / 3600)
+        item = agg.setdefault(category, [0, 0.0])
+        item[0] += 1
+        item[1] += hours
+    lines = [f"📊 <b>За последние 7 дней</b> — событий: {len(events)}", ""]
+    for category, (cnt, hours) in sorted(agg.items(), key=lambda kv: -kv[1][0]):
+        emoji = CATEGORY_EMOJI.get(category, "📌")
+        label = CATEGORY_LABEL.get(category, category)
+        line = f"{emoji} {label} — {cnt}"
+        if hours:
+            line += f" ({hours:.1f} ч)"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 # ---------- карточка события и действия ----------
 
 def event_actions_kb(token: str) -> InlineKeyboardMarkup:
@@ -524,29 +836,45 @@ async def show_event_card(cq: CallbackQuery, token: str):
     if client is None:
         await cq.message.edit_text("Apple ID не подключён — открой ⚙️ Настройки.")
         return
-    ev_dict = await asyncio.to_thread(client.get_event, data["uid"])
+    ev_dict = await asyncio.to_thread(client.get_event, data["uid"], data.get("cal"))
     if not ev_dict:
         await cq.message.edit_text("⚠️ Событие не найдено (возможно, удалено).")
         return
+    data["cal"] = ev_dict.get("calendar") or data.get("cal")
     ev = event_from_caldav(ev_dict, tz)
-    await cq.message.edit_text(event_card(ev, tz), reply_markup=event_actions_kb(token))
+    await cq.message.edit_text(
+        event_card(ev, tz, ev_dict.get("calendar")),
+        reply_markup=event_actions_kb(token),
+    )
 
 
 # ---------- хендлеры: команды и кнопки ----------
+
+START_TEXT = (
+    "Привет! Я добавляю события в твой Apple Calendar.\n\n"
+    "<b>Что я умею:</b>\n"
+    "📝 События в любом виде — текст, голосовое, фото афиши, пересланное сообщение\n"
+    "🔁 Повторяющиеся события — «йога каждый вторник в 19:00»\n"
+    "🧠 Вопросы о планах — «что у меня завтра?»\n"
+    "🔍 Поиск свободного времени — «найди час на этой неделе для встречи»\n"
+    "🧹 Массовые операции — «отмени всё в пятницу», «сдвинь созвоны на час»\n"
+    "✏️ Правки кнопками (тапни событие в списке) или текстом — «перенеси врача на 18:00»\n"
+    "⚠️ Предупреждаю о дублях и пересечениях в расписании\n"
+    "📁 Выбор календаря прямо в карточке события\n"
+    "⏰ Напоминания: нативные Apple + пинг в чат с кнопкой «+15 мин»\n"
+    "🌅 Утренний дайджест дня (вкл/выкл в настройках)\n"
+    "📊 Статистика недели — в ⚙️ Настройки\n\n"
+    "Кнопки снизу — расписание, напоминания и настройки. Показываю события "
+    "из всех твоих календарей. Отмена текущего ввода — /cancel."
+)
+
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     u = await ensure_ready(message)
     if not u:
         return
-    await message.answer(
-        "Привет! Я добавляю события в твой Apple Calendar.\n\n"
-        "Просто пришли событие в любом виде — текст, голосовое, фото афиши или "
-        "пересланное сообщение. Я покажу карточку и запишу после подтверждения.\n\n"
-        "Кнопки снизу — расписание, напоминания и настройки. Чтобы изменить "
-        "событие, открой день и тапни по нему.",
-        reply_markup=main_kb(),
-    )
+    await message.answer(START_TEXT, reply_markup=main_kb())
 
 
 @dp.message(Command("cancel"))
@@ -605,7 +933,7 @@ async def btn_reminders(message: Message):
     rows = []
     for e in events[:20]:
         token = new_token()
-        EVENTS[token] = {"uid": e["uid"], "offset": 0}
+        EVENTS[token] = {"uid": e["uid"], "offset": 0, "cal": e.get("calendar")}
         rem = ("🔔 " + ", ".join(rem_label(m) for m in e["reminders_minutes"])
                if e.get("reminders_minutes") else "🔕 нет")
         rows.append([InlineKeyboardButton(
@@ -625,9 +953,14 @@ def render_settings(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     cal_name = u.get("calendar_name") or "первый доступный"
     tz_name = user_tz_name(u)
     email = u.get("icloud_username") or "не подключён"
+    digest_on = bool(u.get("digest_enabled", 1))
     rows = [
         [InlineKeyboardButton(text=f"📁 Календарь: {cal_name}"[:60], callback_data="set:cal")],
         [InlineKeyboardButton(text=f"🌍 Часовой пояс: {tz_name}"[:60], callback_data="set:tz")],
+        [InlineKeyboardButton(
+            text=f"🌅 Утренний дайджест: {'вкл' if digest_on else 'выкл'}",
+            callback_data="set:dig")],
+        [InlineKeyboardButton(text="📊 Статистика недели", callback_data="set:stats")],
         [InlineKeyboardButton(text=f"🍏 Apple ID: {email}"[:60], callback_data="setup")],
     ]
     if is_admin(user_id):
@@ -658,6 +991,33 @@ async def cb_settings_menu(cq: CallbackQuery):
     await cq.answer()
 
 
+@dp.callback_query(F.data == "set:dig")
+async def cb_settings_digest(cq: CallbackQuery):
+    u = store.get_user(cq.from_user.id) or {}
+    store.set_digest(cq.from_user.id, not bool(u.get("digest_enabled", 1)))
+    text, kb = render_settings(cq.from_user.id)
+    await cq.message.edit_text(text, reply_markup=kb)
+    await cq.answer()
+
+
+@dp.callback_query(F.data == "set:stats")
+async def cb_settings_stats(cq: CallbackQuery):
+    await cq.answer()
+    client = client_or_none(cq.from_user.id)
+    if client is None:
+        await cq.message.edit_text("Apple ID не подключён — открой ⚙️ Настройки.")
+        return
+    await cq.message.edit_text("⏳ Считаю статистику…")
+    try:
+        text = await build_stats(cq.from_user.id)
+    except Exception as e:
+        text = f"⚠️ Не смог прочитать календарь: {e}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="◀️ Настройки", callback_data="set:menu"),
+    ]])
+    await cq.message.edit_text(text, reply_markup=kb)
+
+
 def _calendars_kb(names: list[str]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=f"📁 {n}"[:60], callback_data=f"calpick:{i}")]
             for i, n in enumerate(names[:20])]
@@ -682,7 +1042,7 @@ async def cb_settings_calendar(cq: CallbackQuery):
         await cq.answer()
         return
     SETUP[uid] = names
-    await cq.message.edit_text("📁 Выбери календарь для событий:", reply_markup=_calendars_kb(names))
+    await cq.message.edit_text("📁 Выбери календарь по умолчанию:", reply_markup=_calendars_kb(names))
     await cq.answer()
 
 
@@ -699,8 +1059,9 @@ async def cb_calendar_pick(cq: CallbackQuery):
     cal.drop(uid)
     SETUP.pop(uid, None)
     await cq.message.edit_text(
-        f"📁 Календарь: <b>{name}</b>\n\nГотово! Пришли событие — текстом, "
-        "голосом или фото афиши."
+        f"📁 Календарь по умолчанию: <b>{name}</b>\n\nГотово! Пришли событие — "
+        "текстом, голосом или фото афиши. Календарь можно поменять прямо в "
+        "карточке события."
     )
     await cq.message.answer("Кнопки снизу — расписание и настройки.", reply_markup=main_kb())
     await cq.answer()
@@ -939,7 +1300,7 @@ async def handle_setup_text(message: Message, pending: dict, bot: Bot):
             return
         SETUP[uid] = names
         await status.edit_text(
-            "✅ Подключился! Выбери календарь для событий:",
+            "✅ Подключился! Выбери календарь по умолчанию:",
             reply_markup=_calendars_kb(names),
         )
 
@@ -968,16 +1329,17 @@ async def handle_awaited_text(message: Message, pending: dict, u: dict):
         return
 
     if mode == "rename":
-        ev_dict = await asyncio.to_thread(client.get_event, pending["uid"])
+        ev_dict = await asyncio.to_thread(client.get_event, pending["uid"], pending.get("cal"))
         if not ev_dict:
             await message.answer("⚠️ Событие не найдено.")
             return
         ev = event_from_caldav(ev_dict, tz)
         ev.title = message.text.strip()
-        await _apply_update(message, pending["uid"], ev, "✅ Переименовано", u)
+        await _apply_update(message, pending["uid"], ev, "✅ Переименовано", u,
+                            ev_dict.get("calendar"))
 
     elif mode == "reschedule":
-        ev_dict = await asyncio.to_thread(client.get_event, pending["uid"])
+        ev_dict = await asyncio.to_thread(client.get_event, pending["uid"], pending.get("cal"))
         if not ev_dict:
             await message.answer("⚠️ Событие не найдено.")
             return
@@ -992,7 +1354,8 @@ async def handle_awaited_text(message: Message, pending: dict, u: dict):
             return
         ev = event_from_caldav(ev_dict, tz)
         _shift_to(ev, new_start, _iso(when.get("end"), tz), bool(when.get("all_day")))
-        await _apply_update(message, pending["uid"], ev, "✅ Перенесено", u)
+        await _apply_update(message, pending["uid"], ev, "✅ Перенесено", u,
+                            ev_dict.get("calendar"))
 
     elif mode == "remind_custom":
         m = _parse_reminder_minutes(message.text)
@@ -1007,11 +1370,7 @@ async def handle_awaited_text(message: Message, pending: dict, u: dict):
         rem = set(data["event"].get("reminders_minutes") or [])
         rem.add(m)
         data["event"]["reminders_minutes"] = sorted(rem)
-        ev = Event.from_dict(data["event"])
-        await message.answer(
-            event_card(ev, tz) + "\n\nДобавить в календарь?",
-            reply_markup=create_confirm_kb(token, set(ev.reminders_minutes)),
-        )
+        await _render_create_card(message, token, tz, edit=False)
 
 
 def _shift_to(ev: Event, new_start: datetime, new_end: datetime | None, all_day: bool):
@@ -1039,11 +1398,12 @@ def _parse_reminder_minutes(text: str) -> int | None:
     return n
 
 
-async def _apply_update(message: Message, uid: str, ev: Event, ok_text: str, u: dict):
+async def _apply_update(message: Message, uid: str, ev: Event, ok_text: str, u: dict,
+                        cal_name: str | None = None):
     tz = user_tz(u["user_id"])
     try:
         client = cal.for_user(u["user_id"])
-        ok = await asyncio.to_thread(client.update_event, uid, ev)
+        ok = await asyncio.to_thread(client.update_event, uid, ev, cal_name)
     except Exception as e:
         await message.answer(f"⚠️ Ошибка записи в календарь: {e}")
         return
@@ -1070,12 +1430,87 @@ async def cb_event(cq: CallbackQuery):
     await cq.answer()
 
 
+@dp.callback_query(F.data.startswith("evu:"))
+async def cb_event_by_uid(cq: CallbackQuery):
+    """Открыть карточку по UID (кнопка «Карточка» на пинге напоминания)."""
+    ev_uid = cq.data.split(":", 1)[1]
+    token = new_token()
+    EVENTS[token] = {"uid": ev_uid, "offset": 0,
+                     "cal": store.get_event_calendar(ev_uid)}
+    await show_event_card(cq, token)
+    await cq.answer()
+
+
+@dp.callback_query(F.data.startswith("snz:"))
+async def cb_snooze(cq: CallbackQuery):
+    """«+15 мин» на пинге напоминания."""
+    rest = cq.data.split(":", 1)[1]
+    ev_uid, minutes = rest.rsplit(":", 1)
+    when = datetime.now().astimezone() + timedelta(minutes=int(minutes))
+    store.set_snooze(ev_uid, when.isoformat())
+    try:
+        await cq.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await cq.answer(f"⏰ Напомню ещё раз через {minutes} мин")
+
+
 @dp.callback_query(F.data.startswith("back:"))
 async def cb_back(cq: CallbackQuery):
     token = cq.data.split(":", 1)[1]
     offset = (EVENTS.get(token) or {}).get("offset", 0)
     text, kb = await render_day(offset, cq.from_user.id)
     await cq.message.edit_text(text, reply_markup=kb)
+    await cq.answer()
+
+
+# ---------- колбэки: выбор календаря в карточке создания ----------
+
+@dp.callback_query(F.data.startswith("crl:"))
+async def cb_create_calendar_menu(cq: CallbackQuery):
+    token = cq.data.split(":", 1)[1]
+    if token not in PENDING:
+        await cq.answer("Устарело", show_alert=True)
+        return
+    client = client_or_none(cq.from_user.id)
+    if client is None:
+        await cq.answer("Apple ID не подключён", show_alert=True)
+        return
+    try:
+        names = await asyncio.to_thread(client.list_calendar_names)
+    except Exception as e:
+        await cq.answer(f"Не смог получить календари: {e}"[:190], show_alert=True)
+        return
+    CALPICK[token] = names
+    rows = [[InlineKeyboardButton(text=f"📁 {n}"[:60], callback_data=f"crp:{token}:{i}")]
+            for i, n in enumerate(names[:20])]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"crb:{token}")])
+    await cq.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await cq.answer()
+
+
+@dp.callback_query(F.data.startswith("crp:"))
+async def cb_create_calendar_pick(cq: CallbackQuery):
+    _, token, idx = cq.data.split(":")
+    data = PENDING.get(token)
+    names = CALPICK.get(token)
+    if not data or not names or int(idx) >= len(names):
+        await cq.answer("Устарело", show_alert=True)
+        return
+    data["calendar"] = names[int(idx)]
+    CALPICK.pop(token, None)
+    await _render_create_card(cq.message, token, user_tz(cq.from_user.id))
+    await cq.answer(f"📁 {data['calendar']}")
+
+
+@dp.callback_query(F.data.startswith("crb:"))
+async def cb_create_calendar_back(cq: CallbackQuery):
+    token = cq.data.split(":", 1)[1]
+    if token not in PENDING:
+        await cq.answer("Устарело", show_alert=True)
+        return
+    CALPICK.pop(token, None)
+    await _render_create_card(cq.message, token, user_tz(cq.from_user.id))
     await cq.answer()
 
 
@@ -1108,7 +1543,7 @@ async def cb_reschedule_preset(cq: CallbackQuery):
     if client is None:
         await cq.answer("Apple ID не подключён", show_alert=True)
         return
-    ev_dict = await asyncio.to_thread(client.get_event, data["uid"])
+    ev_dict = await asyncio.to_thread(client.get_event, data["uid"], data.get("cal"))
     if not ev_dict:
         await cq.message.edit_text("⚠️ Событие не найдено.")
         await cq.answer()
@@ -1119,7 +1554,8 @@ async def cb_reschedule_preset(cq: CallbackQuery):
     if ev.end:
         ev.end = _to_dt(ev.end, tz) + delta
     try:
-        ok = await asyncio.to_thread(client.update_event, data["uid"], ev)
+        ok = await asyncio.to_thread(client.update_event, data["uid"], ev,
+                                     ev_dict.get("calendar"))
     except Exception as e:
         await cq.message.edit_text(f"⚠️ Ошибка записи: {e}")
         await cq.answer()
@@ -1140,7 +1576,7 @@ async def cb_reschedule_manual(cq: CallbackQuery):
     if not data:
         await cq.answer("Событие устарело", show_alert=True)
         return
-    AWAITING[cq.from_user.id] = {"mode": "reschedule", "uid": data["uid"]}
+    AWAITING[cq.from_user.id] = {"mode": "reschedule", "uid": data["uid"], "cal": data.get("cal")}
     await cq.message.edit_text("🕒 Напиши новое время, например «завтра в 15:00» или «в пятницу 18:00».")
     await cq.answer()
 
@@ -1154,7 +1590,7 @@ async def cb_rename(cq: CallbackQuery):
     if not data:
         await cq.answer("Событие устарело", show_alert=True)
         return
-    AWAITING[cq.from_user.id] = {"mode": "rename", "uid": data["uid"]}
+    AWAITING[cq.from_user.id] = {"mode": "rename", "uid": data["uid"], "cal": data.get("cal")}
     await cq.message.edit_text("✏️ Напиши новое название события.")
     await cq.answer()
 
@@ -1172,13 +1608,14 @@ async def cb_reminder_menu(cq: CallbackQuery):
     if client is None:
         await cq.answer("Apple ID не подключён", show_alert=True)
         return
-    ev_dict = await asyncio.to_thread(client.get_event, data["uid"])
+    ev_dict = await asyncio.to_thread(client.get_event, data["uid"], data.get("cal"))
     if not ev_dict:
         await cq.message.edit_text("⚠️ Событие не найдено.")
         await cq.answer()
         return
     REMWORK[token] = set(ev_dict.get("reminders_minutes") or [])
     data["title"] = ev_dict["title"]
+    data["cal"] = ev_dict.get("calendar") or data.get("cal")
     await _render_reminder_menu(cq, token, ev_dict["title"])
     await cq.answer()
 
@@ -1219,7 +1656,7 @@ async def cb_reminder_save(cq: CallbackQuery):
     if client is None:
         await cq.answer("Apple ID не подключён", show_alert=True)
         return
-    ev_dict = await asyncio.to_thread(client.get_event, data["uid"])
+    ev_dict = await asyncio.to_thread(client.get_event, data["uid"], data.get("cal"))
     if not ev_dict:
         await cq.message.edit_text("⚠️ Событие не найдено.")
         await cq.answer()
@@ -1227,7 +1664,8 @@ async def cb_reminder_save(cq: CallbackQuery):
     ev = event_from_caldav(ev_dict, tz)
     ev.reminders_minutes = sorted(REMWORK.get(token, set()))
     try:
-        ok = await asyncio.to_thread(client.update_event, data["uid"], ev)
+        ok = await asyncio.to_thread(client.update_event, data["uid"], ev,
+                                     ev_dict.get("calendar"))
     except Exception as e:
         await cq.message.edit_text(f"⚠️ Ошибка записи: {e}")
         await cq.answer()
@@ -1264,7 +1702,7 @@ async def cb_delete_yes(cq: CallbackQuery):
         await cq.answer("Apple ID не подключён", show_alert=True)
         return
     try:
-        ok = await asyncio.to_thread(client.delete_event, data["uid"])
+        ok = await asyncio.to_thread(client.delete_event, data["uid"], data.get("cal"))
     except Exception as e:
         await cq.message.edit_text(f"⚠️ Ошибка удаления: {e}")
         await cq.answer()
@@ -1287,15 +1725,10 @@ async def cb_create_reminder_toggle(cq: CallbackQuery):
     if not data:
         await cq.answer("Устарело", show_alert=True)
         return
-    tz = user_tz(cq.from_user.id)
     rem = set(data["event"].get("reminders_minutes") or [])
     rem.discard(m) if m in rem else rem.add(m)
     data["event"]["reminders_minutes"] = sorted(rem)
-    ev = Event.from_dict(data["event"])
-    await cq.message.edit_text(
-        event_card(ev, tz) + "\n\nДобавить в календарь?",
-        reply_markup=create_confirm_kb(token, rem),
-    )
+    await _render_create_card(cq.message, token, user_tz(cq.from_user.id))
     await cq.answer()
 
 
@@ -1319,16 +1752,37 @@ async def on_ok(cq: CallbackQuery):
         return
     user_id = data.get("user_id", cq.from_user.id)
     tz = user_tz(user_id)
+
+    if data["action"] == "bulk":
+        await cq.message.edit_text("⏳ Применяю…")
+        try:
+            await _apply_bulk(cq, data)
+        except Exception as e:
+            await cq.message.edit_text(f"⚠️ Ошибка: {e}")
+        return
+
     ev = Event.from_dict(data["event"])
     await cq.message.edit_text("⏳ Записываю в календарь…")
     try:
         client = cal.for_user(user_id)
         if data["action"] == "create":
-            uid = await asyncio.to_thread(client.create_event, ev)
-            store.add(uid, data["chat_id"], ev.title, ev.start)
-            await cq.message.edit_text("✅ Добавлено в календарь\n\n" + event_card(ev, tz))
+            uid, cal_name = await asyncio.to_thread(
+                client.create_event, ev, data.get("calendar")
+            )
+            store.add(uid, data["chat_id"], ev.title, ev.start, cal_name)
+            undo_token = new_token()
+            UNDO[undo_token] = {"uid": uid, "cal": cal_name}
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="↩️ Отменить", callback_data=f"und:{undo_token}"),
+            ]])
+            await cq.message.edit_text(
+                "✅ Добавлено в календарь\n\n" + event_card(ev, tz, cal_name),
+                reply_markup=kb,
+            )
         else:  # edit
-            ok = await asyncio.to_thread(client.update_event, data["uid"], ev)
+            ok = await asyncio.to_thread(
+                client.update_event, data["uid"], ev, data.get("cal")
+            )
             if ok:
                 store.update_start(data["uid"], ev.title, ev.start)
                 await cq.message.edit_text("✅ Изменено\n\n" + event_card(ev, tz))
@@ -1338,10 +1792,35 @@ async def on_ok(cq: CallbackQuery):
         await cq.message.edit_text(f"⚠️ Ошибка записи в календарь: {e}")
 
 
+@dp.callback_query(F.data.startswith("und:"))
+async def cb_undo(cq: CallbackQuery):
+    token = cq.data.split(":", 1)[1]
+    data = UNDO.pop(token, None)
+    if not data:
+        await cq.answer("Отменять уже нечего", show_alert=True)
+        return
+    client = client_or_none(cq.from_user.id)
+    if client is None:
+        await cq.answer("Apple ID не подключён", show_alert=True)
+        return
+    try:
+        ok = await asyncio.to_thread(client.delete_event, data["uid"], data.get("cal"))
+    except Exception as e:
+        await cq.answer(f"Не получилось: {e}"[:190], show_alert=True)
+        return
+    if ok:
+        store.remove(data["uid"])
+        await cq.message.edit_text("↩️ Отменено — событие удалено из календаря.")
+    else:
+        await cq.message.edit_text("⚠️ Событие не найдено (возможно, уже удалено).")
+    await cq.answer()
+
+
 @dp.callback_query(F.data.startswith("no:"))
 async def on_no(cq: CallbackQuery):
     token = cq.data.split(":", 1)[1]
     PENDING.pop(token, None)
+    CALPICK.pop(token, None)
     await cq.message.edit_text("Отменил.")
     await cq.answer()
 
@@ -1508,8 +1987,7 @@ async def main():
         BotCommand(command="start", description="Запуск / меню"),
         BotCommand(command="cancel", description="Отменить текущий ввод"),
     ])
-    if config.TELEGRAM_REMINDERS:
-        notifier.setup(bot, asyncio.get_running_loop())
+    notifier.setup(bot, asyncio.get_running_loop())  # пинги + утренний дайджест
     print("Bot started.")
     await dp.start_polling(bot)
 
