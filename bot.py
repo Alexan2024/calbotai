@@ -8,7 +8,10 @@ UX кнопочный: постоянная reply-клавиатура, инла
 тапабельные события с действиями. Правки идут по UID (+ имя календаря);
 текстовый разбор («перенеси врача») — запасной путь.
 
-Новое: выбор календаря прямо в карточке создания; чтение (день/неделя/месяц/
+Визуал: псевдографический таймлайн дня, инлайн-календарь месяца 7×N с
+индикатором загрузки (тап по дню открывает день), бар-чарт статистики.
+
+Ещё: выбор календаря прямо в карточке создания; чтение (день/неделя/месяц/
 напоминания/дайджест/статистика) идёт по ВСЕМ календарям; повторяющиеся
 события (RRULE); утренний дайджест; кнопки на пинге напоминания (+15 мин /
 карточка); детектор пересечений; поиск свободного слота; undo после создания;
@@ -16,6 +19,8 @@ UX кнопочный: постоянная reply-клавиатура, инла
 """
 from __future__ import annotations
 import asyncio
+import calendar as pycal
+import html
 import io
 import re
 import uuid
@@ -45,6 +50,8 @@ DEFAULT_TZ = pytz.timezone(config.TIMEZONE)
 dp = Dispatcher()
 
 DAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+MONTHS_RU = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль",
+             "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
 
 # category -> эмодзи. Значок выбирает бот по category от LLM, не сама модель,
 # чтобы одинаковые события всегда получали один и тот же символ.
@@ -715,6 +722,45 @@ def day_title(offset: int, tz) -> str:
     return label
 
 
+def _day_timeline(events: list[dict], tz) -> str:
+    """Псевдографический таймлайн часов: ▓ — занято, справа — название события."""
+    timed = []
+    for e in events:
+        if e["all_day"] or not isinstance(e["start"], datetime):
+            continue
+        s = _to_dt(e["start"], tz).astimezone(tz)
+        en = _to_dt(e["end"], tz).astimezone(tz) if e.get("end") else s + timedelta(hours=1)
+        if en <= s:
+            en = s + timedelta(hours=1)
+        timed.append((s, en, e["title"]))
+    if not timed:
+        return ""
+    timed.sort(key=lambda t: t[0])
+
+    lo = min(config.WORKDAY_START, min(s.hour for s, _, _ in timed))
+    hi = max(config.WORKDAY_END,
+             max(en.hour + (1 if en.minute else 0) for _, en, _ in timed))
+    lo = max(0, lo)
+    hi = min(24, max(hi, lo + 1))
+
+    day0 = timed[0][0].replace(hour=0, minute=0, second=0, microsecond=0)
+
+    rows = []
+    for h in range(lo, hi):
+        slot_s = day0 + timedelta(hours=h)
+        slot_e = slot_s + timedelta(hours=1)
+        busy = any(s < slot_e and slot_s < en for s, en, _ in timed)
+        starting = [t for t in timed if slot_s <= t[0] < slot_e]
+        bar = "▓" if busy else " "
+        label = ""
+        if starting:
+            label = " " + html.escape(starting[0][2])[:28]
+            if len(starting) > 1:
+                label += f" +{len(starting) - 1}"
+        rows.append(f"{h:02d} │{bar}{label}")
+    return "<pre>" + "\n".join(rows) + "</pre>"
+
+
 async def render_day(offset: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     tz = user_tz(user_id)
     dt_from, dt_to = day_bounds(offset, tz)
@@ -738,7 +784,20 @@ async def render_day(offset: int, user_id: int) -> tuple[str, InlineKeyboardMark
     if not events:
         text = f"🗓 <b>{day_title(offset, tz)}</b>\n\nПусто 🎉"
     else:
-        lines = [f"🗓 <b>{day_title(offset, tz)}</b>", "", "Тапни событие, чтобы изменить:"]
+        parts = [f"🗓 <b>{day_title(offset, tz)}</b>"]
+
+        allday = [e for e in events
+                  if e["all_day"] or not isinstance(e["start"], datetime)]
+        if allday:
+            parts.append("")
+            parts += [f"🔸 весь день — {e['title']}" for e in allday]
+
+        tl = _day_timeline(events, tz)
+        if tl:
+            parts.append(tl)
+
+        parts.append("Тапни событие, чтобы изменить:")
+
         for e in events:
             token = new_token()
             EVENTS[token] = {"uid": e["uid"], "offset": offset, "cal": e.get("calendar")}
@@ -748,33 +807,60 @@ async def render_day(offset: int, user_id: int) -> tuple[str, InlineKeyboardMark
                 text=f"{when} · {e['title']}"[:60],
                 callback_data=f"ev:{token}",
             )])
-        text = "\n".join(lines)
+        text = "\n".join(parts)
 
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def render_month(message: Message, user_id: int):
+# ---------- месяц: инлайн-календарь 7×N ----------
+
+async def render_month_grid(user_id: int, year: int, month: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Сетка месяца кнопками. Тап по числу открывает день (day:<offset>)."""
     tz = user_tz(user_id)
-    dt_from, _ = day_bounds(0, tz)
-    dt_to = dt_from + timedelta(days=30)
+    first = tz.localize(datetime(year, month, 1))
+    days_in = pycal.monthrange(year, month)[1]
+    last = first + timedelta(days=days_in)
+
+    prev_y, prev_m = (year - 1, 12) if month == 1 else (year, month - 1)
+    next_y, next_m = (year + 1, 1) if month == 12 else (year, month + 1)
+    nav = [
+        InlineKeyboardButton(text="◀️", callback_data=f"mon:{prev_y}:{prev_m}"),
+        InlineKeyboardButton(text="📅 Сегодня", callback_data="day:0"),
+        InlineKeyboardButton(text="▶️", callback_data=f"mon:{next_y}:{next_m}"),
+    ]
+
     try:
         client = cal.for_user(user_id)
-        events = await asyncio.to_thread(client.list_events, dt_from, dt_to)
+        events = await asyncio.to_thread(client.list_events, first, last)
     except Exception as e:
-        await message.answer(f"⚠️ Не смог прочитать календарь: {e}")
-        return
-    if not events:
-        await message.answer("На ближайший месяц событий нет 🎉")
-        return
-    lines = ["📆 <b>Ближайшие 30 дней</b>"]
-    cur_day = None
+        return (f"⚠️ Не смог прочитать календарь: {e}",
+                InlineKeyboardMarkup(inline_keyboard=[nav]))
+
+    counts: dict[date, int] = {}
     for e in events:
         d = e["start"].date() if isinstance(e["start"], datetime) else e["start"]
-        if d != cur_day:
-            cur_day = d
-            lines.append(f"\n<b>{d.strftime('%d.%m')} ({DAYS[d.weekday()]})</b>")
-        lines.append(_schedule_line(e, tz))
-    await message.answer("\n".join(lines))
+        counts[d] = counts.get(d, 0) + 1
+
+    today = now(tz).date()
+    rows = [[InlineKeyboardButton(text=d, callback_data="nop") for d in DAYS]]
+    for week in pycal.Calendar(firstweekday=0).monthdatescalendar(year, month):
+        row = []
+        for d in week:
+            if d.month != month:
+                row.append(InlineKeyboardButton(text=" ", callback_data="nop"))
+                continue
+            n = counts.get(d, 0)
+            mark = "" if n == 0 else ("·" if n <= 2 else "▪")
+            label = f"[{d.day}]{mark}" if d == today else f"{d.day}{mark}"
+            row.append(InlineKeyboardButton(
+                text=label, callback_data=f"day:{(d - today).days}"))
+        rows.append(row)
+    rows.append(nav)
+
+    text = (f"📆 <b>{MONTHS_RU[month - 1]} {year}</b>\n"
+            f"Событий: {len(events)}   ·  = 1–2,  ▪ = 3+\n"
+            f"Тапни день, чтобы открыть.")
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ---------- статистика за неделю ----------
@@ -799,15 +885,21 @@ async def build_stats(user_id: int) -> str:
         item = agg.setdefault(category, [0, 0.0])
         item[0] += 1
         item[1] += hours
-    lines = [f"📊 <b>За последние 7 дней</b> — событий: {len(events)}", ""]
+
+    total_h = sum(h for _, h in agg.values())
+    mx = max(c for c, _ in agg.values()) or 1
+    header = (f"📊 <b>За последние 7 дней</b>\n"
+              f"Событий: {len(events)} · часов: {total_h:.1f}\n")
+    bars = []
     for category, (cnt, hours) in sorted(agg.items(), key=lambda kv: -kv[1][0]):
         emoji = CATEGORY_EMOJI.get(category, "📌")
         label = CATEGORY_LABEL.get(category, category)
-        line = f"{emoji} {label} — {cnt}"
+        bar = "█" * max(1, round(cnt / mx * 12))
+        line = f"{emoji} {label:<12}{bar} {int(cnt)}"
         if hours:
-            line += f" ({hours:.1f} ч)"
-        lines.append(line)
-    return "\n".join(lines)
+            line += f" · {hours:.1f}ч"
+        bars.append(line)
+    return header + "<pre>" + "\n".join(bars) + "</pre>"
 
 
 # ---------- карточка события и действия ----------
@@ -910,7 +1002,22 @@ async def btn_month(message: Message):
     if not u:
         return
     AWAITING.pop(message.from_user.id, None)
-    await render_month(message, u["user_id"])
+    d = now(user_tz(u["user_id"]))
+    text, kb = await render_month_grid(u["user_id"], d.year, d.month)
+    await message.answer(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("mon:"))
+async def cb_month(cq: CallbackQuery):
+    _, y, m = cq.data.split(":")
+    text, kb = await render_month_grid(cq.from_user.id, int(y), int(m))
+    await cq.message.edit_text(text, reply_markup=kb)
+    await cq.answer()
+
+
+@dp.callback_query(F.data == "nop")
+async def cb_nop(cq: CallbackQuery):
+    await cq.answer()
 
 
 @dp.message(F.text == "🔔 Напоминания")
