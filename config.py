@@ -41,9 +41,8 @@ STT_MODEL = os.environ.get(
     "whisper-large-v3" if STT_PROVIDER == "groq" else "whisper-1",
 )
 
-# iCloud-креды владельца — теперь ОПЦИОНАЛЬНЫ: используются один раз для
+# iCloud-креды владельца — ОПЦИОНАЛЬНЫ: используются один раз для
 # автоматической привязки аккаунта админа при первом запуске (bootstrap).
-# Все пользователи (включая админа) хранят свои креды в SQLite.
 ICLOUD_USERNAME = os.environ.get("ICLOUD_USERNAME") or None
 ICLOUD_PASSWORD = os.environ.get("ICLOUD_PASSWORD") or None
 ICLOUD_CALENDAR_NAME = os.environ.get("ICLOUD_CALENDAR_NAME", "").strip() or None
@@ -52,5 +51,12 @@ CALDAV_URL = os.environ.get("CALDAV_URL", "https://caldav.icloud.com/")
 TIMEZONE = os.environ.get("TIMEZONE", "Europe/Moscow")  # пояс по умолчанию
 DEFAULT_REMINDERS = _int_list(os.environ.get("DEFAULT_REMINDERS", "60,10"))
 TELEGRAM_REMINDERS = os.environ.get("TELEGRAM_REMINDERS", "true").lower() == "true"
+
+# Утренний дайджест: час отправки по локальному поясу пользователя.
+DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR", "8"))
+
+# Рабочее окно для поиска свободных слотов («найди час на этой неделе»).
+WORKDAY_START = int(os.environ.get("WORKDAY_START", "9"))
+WORKDAY_END = int(os.environ.get("WORKDAY_END", "21"))
 
 DB_PATH = os.environ.get("DB_PATH", "tgcalbot.sqlite3")
