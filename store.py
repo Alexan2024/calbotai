@@ -1,7 +1,8 @@
 """Хранилище (SQLite): пользователи бота и созданные события.
 
-users  — доступ (pending/approved/blocked), Apple ID + шифрованный пароль
-         приложения, выбранный календарь, часовой пояс, настройки дайджеста.
+users  — доступ (pending/approved/blocked), провайдер календаря
+         (icloud | google), email + шифрованный пароль приложения,
+         выбранный календарь, часовой пояс, настройки дайджеста.
 events — созданные ботом события: для правок, пинг-напоминаний и снуза.
 """
 import sqlite3
@@ -25,7 +26,7 @@ CREATE TABLE IF NOT EXISTS users (
     user_id         INTEGER PRIMARY KEY,
     tg_name         TEXT,
     status          TEXT NOT NULL DEFAULT 'pending',   -- pending | approved | blocked
-    icloud_username TEXT,
+    icloud_username TEXT,                              -- email аккаунта (имя историческое, хранит и Google)
     icloud_password TEXT,                              -- зашифровано (security.py)
     calendar_name   TEXT,
     timezone        TEXT,
@@ -47,10 +48,12 @@ _ensure_column("events", "calendar", "TEXT")                              # гд
 _ensure_column("events", "snooze_iso", "TEXT")                            # «напомнить ещё раз в …»
 _ensure_column("users", "digest_enabled", "INTEGER NOT NULL DEFAULT 1")   # утренний дайджест
 _ensure_column("users", "last_digest_date", "TEXT")                       # защита от повторной отправки
+_ensure_column("users", "provider", "TEXT NOT NULL DEFAULT 'icloud'")     # icloud | google
 
 _USER_KEYS = [
     "user_id", "tg_name", "status", "icloud_username", "icloud_password",
-    "calendar_name", "timezone", "created_at", "digest_enabled", "last_digest_date",
+    "calendar_name", "timezone", "created_at", "digest_enabled",
+    "last_digest_date", "provider",
 ]
 _USER_COLS = ", ".join(_USER_KEYS)
 
@@ -78,10 +81,13 @@ def set_status(user_id: int, status: str):
     _conn.commit()
 
 
-def set_credentials(user_id: int, icloud_username: str, icloud_password_enc: str):
+def set_credentials(user_id: int, username: str, password_enc: str,
+                    provider: str = "icloud"):
+    """Сохранить креды CalDAV. Смена аккаунта сбрасывает выбранный календарь."""
     _conn.execute(
-        "UPDATE users SET icloud_username=?, icloud_password=?, calendar_name=NULL WHERE user_id=?",
-        (icloud_username, icloud_password_enc, user_id),
+        "UPDATE users SET icloud_username=?, icloud_password=?, provider=?, "
+        "calendar_name=NULL WHERE user_id=?",
+        (username, password_enc, provider, user_id),
     )
     _conn.commit()
 
@@ -113,7 +119,7 @@ def mark_digest_sent(user_id: int, date_str: str):
 
 
 def users_for_digest() -> list[dict]:
-    """Одобренные пользователи с подключённым Apple ID и включённым дайджестом."""
+    """Одобренные пользователи с подключённым аккаунтом и включённым дайджестом."""
     rows = _conn.execute(
         f"SELECT {_USER_COLS} FROM users "
         "WHERE status='approved' AND icloud_username IS NOT NULL AND digest_enabled=1"
