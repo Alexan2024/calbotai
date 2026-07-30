@@ -3,6 +3,8 @@
 Нативные напоминания Apple ставятся через VALARM в самом событии.
 Здесь — дополнительный пинг в чат (с кнопками «+15 мин» и «Карточка»)
 и ежеутренний дайджест дня по ВСЕМ календарям пользователя.
+
+Дайджест рисуется «рельсой» ▍ (render.digest_rail) — построчно, вне <pre>.
 """
 import asyncio
 from datetime import datetime, timedelta
@@ -14,6 +16,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import calendar_client as cal
 import config
 import store
+import render
 
 CHECK_EVERY_SECONDS = 60
 LEAD_SECONDS = 10 * 60  # напомнить за 10 минут до начала
@@ -31,17 +34,6 @@ def _ping_kb(uid: str) -> InlineKeyboardMarkup | None:
     ]])
 
 
-def _digest_line(e: dict, tz) -> str:
-    if isinstance(e["start"], datetime) and not e["all_day"]:
-        when = e["start"].astimezone(tz).strftime("%H:%M")
-    else:
-        when = "весь день"
-    line = f"• {when} — {e['title']}"
-    if e.get("location"):
-        line += f" ({e['location']})"
-    return line
-
-
 async def _send_digest(bot, u: dict):
     user_id = u["user_id"]
     try:
@@ -57,10 +49,7 @@ async def _send_digest(bot, u: dict):
     except Exception:
         return  # креды протухли/сеть — молча пропускаем, попробуем завтра
     header = f"🌅 План на {day_start.strftime('%d.%m')} ({DAYS[day_start.weekday()]})"
-    if not events:
-        text = header + "\n\nСегодня событий нет 🎉"
-    else:
-        text = header + "\n\n" + "\n".join(_digest_line(e, tz) for e in events)
+    text = render.digest_rail(events, tz, header)
     try:
         await bot.send_message(user_id, text)
     except Exception:
