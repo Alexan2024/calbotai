@@ -16,6 +16,10 @@ UX кнопочный: постоянная reply-клавиатура, инла
 утренний дайджест; кнопки на пинге напоминания (+15 мин / карточка);
 детектор пересечений; поиск свободного слота; undo после создания;
 массовые операции («отмени всё в пятницу»); статистика за неделю.
+
+Визуальный слой (render.py): день рисуется вертикальным таймлайном, неделя —
+hour-heatmap, поиск слота — полосой занятости, статистика — бар-чартом,
+накладки — мини-диаграммой, дайджест — «рельсой». Всё моноширинное — в <pre>.
 """
 from __future__ import annotations
 import asyncio
@@ -42,6 +46,7 @@ import calendar_client as cal
 import store
 import notifier
 import security
+import render
 from models import Event
 
 DEFAULT_TZ = pytz.timezone(config.TIMEZONE)
@@ -409,6 +414,7 @@ async def _conflict_warning(user_id: int, ev: Event, tz) -> str:
         return ""
     mine = _norm_title(ev.title)
     warns = []
+    diagram = None
     for e in nearby:
         if mine and _norm_title(e["title"]) == mine:
             warns.append(f"⚠️ Похожее событие уже есть: {fmt_dt(e['start'], e['all_day'], tz)}")
@@ -420,9 +426,15 @@ async def _conflict_warning(user_id: int, ev: Event, tz) -> str:
         if ev.start < e_end and e_start < ev_end:
             span = f"{e_start.astimezone(tz).strftime('%H:%M')}–{e_end.astimezone(tz).strftime('%H:%M')}"
             warns.append(f"⚠️ Пересекается с «{e['title']}» ({span})")
+            if diagram is None:  # диаграмма только для первой накладки по времени
+                diagram = render.conflict_diagram(
+                    ev.title, ev.start, ev_end, e["title"], e_start, e_end, tz)
     if not warns:
         return ""
-    return "\n\n" + "\n".join(warns[:3])
+    out = "\n\n" + "\n".join(warns[:3])
+    if diagram:
+        out += "\n" + diagram
+    return out
 
 
 # ---------- разбор результата LLM ----------
@@ -467,7 +479,8 @@ async def handle_parsed(message: Message, parsed: dict, u: dict):
         await message.answer(parsed.get("reply") or "Пришли событие текстом, голосом или афишей 🙂")
 
 
-async def send_schedule(message: Message, dt_from: datetime, dt_to: datetime, user_id: int):
+async def send_schedule(message: Message, dt_from: datetime, dt_to: datetime, user_id: int,
+                        heatmap: bool = False):
     tz = user_tz(user_id)
     try:
         client = cal.for_user(user_id)
@@ -487,7 +500,12 @@ async def send_schedule(message: Message, dt_from: datetime, dt_to: datetime, us
             cur_day = d
             lines.append(f"\n<b>{d.strftime('%d.%m')} ({DAYS[d.weekday()]})</b>")
         lines.append(_schedule_line(e, tz))
-    await message.answer(header + "\n".join(lines))
+    body = header + "\n".join(lines)
+    if heatmap:
+        hm = render.week_heatmap(events, tz, dt_from.date(),
+                                 config.WORKDAY_START, config.WORKDAY_END)
+        body = hm + "\n" + body
+    await message.answer(body)
 
 
 def _schedule_line(e: dict, tz) -> str:
@@ -632,8 +650,14 @@ async def handle_find_slot(message: Message, slot: dict, u: dict):
             text=f"{s.strftime('%d.%m')} ({DAYS[s.weekday()]}) {s.strftime('%H:%M')}",
             callback_data=f"slp:{token}:{i}",
         )])
+    occ = render.slot_occupancy(
+        events, free[0].replace(hour=0, minute=0, second=0, microsecond=0), tz,
+        config.WORKDAY_START, config.WORKDAY_END,
+        [s for s in free if s.date() == free[0].date()],
+    )
     await message.answer(
-        f"🔍 Свободные окна на <b>{rem_label(dur)}</b> "
+        occ + "\n\n"
+        + f"🔍 Свободные окна на <b>{rem_label(dur)}</b> "
         f"({dt_from.strftime('%d.%m')}–{dt_to.strftime('%d.%m')}).\n"
         f"Тапни, чтобы создать «{title}»:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -779,20 +803,19 @@ async def render_day(offset: int, user_id: int) -> tuple[str, InlineKeyboardMark
     ]
     rows = [nav]
 
-    if not events:
-        text = f"🗓 <b>{day_title(offset, tz)}</b>\n\nПусто 🎉"
-    else:
-        lines = [f"🗓 <b>{day_title(offset, tz)}</b>", "", "Тапни событие, чтобы изменить:"]
-        for e in events:
-            token = new_token()
-            EVENTS[token] = {"uid": e["uid"], "offset": offset, "cal": e.get("calendar")}
-            when = (e["start"].astimezone(tz).strftime("%H:%M")
-                    if isinstance(e["start"], datetime) and not e["all_day"] else "весь день")
-            rows.append([InlineKeyboardButton(
-                text=f"{when} · {e['title']}"[:60],
-                callback_data=f"ev:{token}",
-            )])
-        text = "\n".join(lines)
+    # текст — вертикальный таймлайн (render.py); кнопки-события оставляем тапабельными
+    for e in events:
+        token = new_token()
+        EVENTS[token] = {"uid": e["uid"], "offset": offset, "cal": e.get("calendar")}
+        when = (e["start"].astimezone(tz).strftime("%H:%M")
+                if isinstance(e["start"], datetime) and not e["all_day"] else "весь день")
+        rows.append([InlineKeyboardButton(
+            text=f"{when} · {e['title']}"[:60],
+            callback_data=f"ev:{token}",
+        )])
+    text = render.day_timeline(events, tz, day_title(offset, tz))
+    if events:
+        text += "\nТапни событие ниже, чтобы изменить."
 
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -843,15 +866,7 @@ async def build_stats(user_id: int) -> str:
         item = agg.setdefault(category, [0, 0.0])
         item[0] += 1
         item[1] += hours
-    lines = [f"📊 <b>За последние 7 дней</b> — событий: {len(events)}", ""]
-    for category, (cnt, hours) in sorted(agg.items(), key=lambda kv: -kv[1][0]):
-        emoji = CATEGORY_EMOJI.get(category, "📌")
-        label = CATEGORY_LABEL.get(category, category)
-        line = f"{emoji} {label} — {cnt}"
-        if hours:
-            line += f" ({hours:.1f} ч)"
-        lines.append(line)
-    return "\n".join(lines)
+    return render.stat_bars(agg, CATEGORY_LABEL, len(events), CATEGORY_EMOJI)
 
 
 # ---------- карточка события и действия ----------
@@ -945,7 +960,7 @@ async def btn_week(message: Message):
         return
     AWAITING.pop(message.from_user.id, None)
     start, _ = day_bounds(0, user_tz(u["user_id"]))
-    await send_schedule(message, start, start + timedelta(days=7), u["user_id"])
+    await send_schedule(message, start, start + timedelta(days=7), u["user_id"], heatmap=True)
 
 
 @dp.message(F.text == "📆 Месяц")
