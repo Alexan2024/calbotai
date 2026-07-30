@@ -9,10 +9,6 @@ def _int_list(raw: str) -> list[int]:
     return [int(x) for x in raw.replace(" ", "").split(",") if x.strip()]
 
 
-def _bool(name: str, default: str) -> bool:
-    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
-
-
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 
 # Владелец бота. Он подтверждает заявки друзей и видит панель пользователей.
@@ -34,21 +30,15 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "").strip() or None
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")      # только для транскрипции (Whisper)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")          # альтернативный провайдер STT
 
-# --- Мозги бота — Claude (Anthropic) ---
+# Мозги бота — Claude (Anthropic)
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-# основная модель: разбор текста/афиш (умная, дорогая)
 LLM_MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-5")
-# быстрая модель: мелкие задачи вроде «разбери „завтра в 15:00“»
-LLM_MODEL_FAST = os.environ.get("LLM_MODEL_FAST", "claude-haiku-4-5")
-LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "1200"))
-# prompt caching системного промпта (экономит входные токены и время до первого токена)
-LLM_CACHE = _bool("LLM_CACHE", "true")
 
 # Распознавание речи: openai | groq | none
 STT_PROVIDER = os.environ.get("STT_PROVIDER", "openai").lower()
 STT_MODEL = os.environ.get(
     "STT_MODEL",
-    "whisper-large-v3-turbo" if STT_PROVIDER == "groq" else "whisper-1",
+    "whisper-large-v3" if STT_PROVIDER == "groq" else "whisper-1",
 )
 
 # iCloud-креды владельца — ОПЦИОНАЛЬНЫ: используются один раз для
@@ -56,24 +46,24 @@ STT_MODEL = os.environ.get(
 ICLOUD_USERNAME = os.environ.get("ICLOUD_USERNAME") or None
 ICLOUD_PASSWORD = os.environ.get("ICLOUD_PASSWORD") or None
 ICLOUD_CALENDAR_NAME = os.environ.get("ICLOUD_CALENDAR_NAME", "").strip() or None
-CALDAV_URL = os.environ.get("CALDAV_URL", "https://caldav.icloud.com/")
 
-# --- CalDAV: производительность ---
-# таймаут одного HTTP-запроса к iCloud (было 30 — юзер ждал минуту с ретраем)
-CALDAV_TIMEOUT = int(os.environ.get("CALDAV_TIMEOUT", "12"))
-# сколько календарей опрашиваем параллельно
-CALDAV_WORKERS = int(os.environ.get("CALDAV_WORKERS", "8"))
-# TTL кэша выборок событий, секунды (0 = выключить кэш)
-CACHE_TTL = int(os.environ.get("CACHE_TTL", "90"))
-# TTL кэша списка календарей, секунды
-CAL_LIST_TTL = int(os.environ.get("CAL_LIST_TTL", "300"))
-
-# Логировать длительность LLM- и CalDAV-операций в stdout ([perf] ...)
-PERF_LOG = _bool("PERF_LOG", "false")
+# --- CalDAV-провайдеры ---
+# Оба провайдера работают по одному протоколу (CalDAV + пароль приложения),
+# различается только базовый URL. Пользователь выбирает провайдера в визарде
+# подключения; выбор хранится в users.provider ("icloud" | "google").
+CALDAV_URL = os.environ.get("CALDAV_URL", "https://caldav.icloud.com/")  # iCloud; имя оставлено для совместимости
+GOOGLE_CALDAV_URL = os.environ.get(
+    "GOOGLE_CALDAV_URL", "https://apidata.googleusercontent.com/caldav/v2/"
+)
+CALDAV_URLS = {
+    "icloud": CALDAV_URL,
+    "google": GOOGLE_CALDAV_URL,
+}
+DEFAULT_PROVIDER = "icloud"
 
 TIMEZONE = os.environ.get("TIMEZONE", "Europe/Moscow")  # пояс по умолчанию
 DEFAULT_REMINDERS = _int_list(os.environ.get("DEFAULT_REMINDERS", "60,10"))
-TELEGRAM_REMINDERS = _bool("TELEGRAM_REMINDERS", "true")
+TELEGRAM_REMINDERS = os.environ.get("TELEGRAM_REMINDERS", "true").lower() == "true"
 
 # Утренний дайджест: час отправки по локальному поясу пользователя.
 DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR", "8"))
