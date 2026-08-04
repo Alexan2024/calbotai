@@ -5,6 +5,11 @@
 и ежеутренний дайджест дня по ВСЕМ календарям пользователя.
 
 Дайджест рисуется «рельсой» ▍ (render.digest_rail) — построчно, вне <pre>.
+
+Важно: перед каждым пингом событие сверяется с живым календарём по UID.
+Если его удалили напрямую в Apple/Google — забываем и не пингуем; если
+перенесли — берём новое время; если переименовали — новое название. Так
+локальная база сама себя чистит от призраков.
 """
 import asyncio
 from datetime import datetime, timedelta
@@ -61,6 +66,35 @@ def setup(bot, loop):
 
     async def reminder_tick():
         for uid, chat_id, title, start_iso in store.due_for_reminder(LEAD_SECONDS):
+            # --- сверка с живым календарём: событие могли изменить/удалить напрямую ---
+            checked = False
+            try:
+                client = cal.for_user(chat_id)   # в личном чате chat_id == user_id
+                cal_hint = store.get_event_calendar(uid)
+                fresh = await asyncio.to_thread(client.get_event, uid, cal_hint)
+                checked = True
+            except Exception:
+                fresh = None  # календарь недоступен (сеть/креды) — не сверяем
+
+            if checked:
+                if fresh is None:
+                    # событие удалено в календаре напрямую — забываем и молчим
+                    store.remove(uid)
+                    continue
+                # событие живо — берём свежие название и время
+                new_title = fresh.get("title") or title
+                new_start = fresh.get("start")
+                if isinstance(new_start, datetime):
+                    store.update_start(uid, new_title, new_start)
+                    now_local = datetime.now().astimezone()
+                    cmp_start = new_start if new_start.tzinfo else new_start.astimezone()
+                    if (cmp_start - now_local).total_seconds() > LEAD_SECONDS:
+                        # перенесли на потом — сейчас молчим, сработает ближе к делу
+                        continue
+                    start_iso = new_start.isoformat()
+                title = new_title
+            # если календарь недоступен — шлём по старым данным (как раньше)
+
             try:
                 start = datetime.fromisoformat(start_iso)
                 when = start.strftime("%H:%M")
