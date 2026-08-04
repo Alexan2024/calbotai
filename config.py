@@ -34,6 +34,17 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")          # альтернатив�
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 LLM_MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-5")
 
+# --- Производительность разбора (добавлено перф-спринтом; llm.py это уже читает) ---
+# Кэш системного промпта Anthropic: cache_control на статическом блоке.
+LLM_CACHE = os.environ.get("LLM_CACHE", "true").lower() == "true"
+# Потолок ответа LLM при разборе события(й). Многособытийным афишам нужен запас.
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "2048"))
+# Быстрая модель для мелких задач (parse_when: «перенеси на завтра в 15:00»).
+# Пусто -> используется основная LLM_MODEL (безопасный дефолт, ничего не ломает).
+LLM_MODEL_FAST = os.environ.get("LLM_MODEL_FAST", "").strip() or LLM_MODEL
+# Логировать тайминги и токены каждого вызова LLM в stdout (строки "[perf] ...").
+PERF_LOG = os.environ.get("PERF_LOG", "false").lower() == "true"
+
 # Распознавание речи: openai | groq | none
 STT_PROVIDER = os.environ.get("STT_PROVIDER", "openai").lower()
 STT_MODEL = os.environ.get(
