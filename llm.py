@@ -202,6 +202,8 @@ def _extract_json(resp, prefill: str | None = None) -> dict:
 async def _ask(system_blocks: list[dict], user_content, model: str,
                max_tokens: int, label: str, prefill: str | None = None) -> dict:
     t0 = time.perf_counter()
+    if not config.LLM_PREFILL:
+        prefill = None  # модель может не поддерживать assistant-prefill
     messages = [{"role": "user", "content": user_content}]
     if prefill:
         # префилл ответа ассистента: модель не «разгоняется», сразу продолжает JSON.
