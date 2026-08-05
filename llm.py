@@ -179,9 +179,14 @@ def _perf(label: str, t0: float, resp=None):
     print(f"[perf] llm {label}: {ms:.0f} ms{extra}", flush=True)
 
 
-def _extract_json(resp) -> dict:
-    """Собрать текст из всех text-блоков ответа (пропуская thinking) и распарсить."""
+def _extract_json(resp, prefill: str | None = None) -> dict:
+    """Собрать текст из всех text-блоков ответа (пропуская thinking) и распарсить.
+
+    При префилле API возвращает только продолжение, поэтому приклеиваем префикс
+    обратно ({...} -> целостный объект)."""
     text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    if prefill:
+        text = prefill + text
     text = text.strip()
     if text.startswith("```"):
         text = text.strip("`")
@@ -195,22 +200,32 @@ def _extract_json(resp) -> dict:
 
 
 async def _ask(system_blocks: list[dict], user_content, model: str,
-               max_tokens: int, label: str) -> dict:
+               max_tokens: int, label: str, prefill: str | None = None) -> dict:
     t0 = time.perf_counter()
+    messages = [{"role": "user", "content": user_content}]
+    if prefill:
+        # префилл ответа ассистента: модель не «разгоняется», сразу продолжает JSON.
+        # Меньше выходных токенов -> меньше latency, и не бывает markdown-обёртки.
+        messages.append({"role": "assistant", "content": prefill})
     resp = await client.messages.create(
         model=model,
         max_tokens=max_tokens,
         system=system_blocks,
-        messages=[{"role": "user", "content": user_content}],
+        messages=messages,
     )
     _perf(label, t0, resp)
-    return _extract_json(resp)
+    return _extract_json(resp, prefill)
 
 
 async def parse_text(text: str, now: datetime, tz: str) -> dict:
+    # короткие сообщения -> быстрая модель; длинные форварды -> основная.
+    # LLM_MODEL_FAST по умолчанию == LLM_MODEL, поэтому без явной настройки
+    # окружения поведение не меняется.
+    model = (config.LLM_MODEL_FAST
+             if len(text) <= config.LLM_FAST_MAXLEN else config.LLM_MODEL)
     return await _ask(
         _system_blocks(STATIC_SYSTEM, now, tz, cacheable=True),
-        text, config.LLM_MODEL, config.LLM_MAX_TOKENS, "parse_text",
+        text, model, config.LLM_MAX_TOKENS, "parse_text", prefill="{",
     )
 
 
@@ -227,6 +242,7 @@ async def parse_image(image_bytes: bytes, caption: str, now: datetime, tz: str) 
     return await _ask(
         _system_blocks(STATIC_SYSTEM, now, tz, cacheable=True),
         user_content, config.LLM_MODEL, config.LLM_MAX_TOKENS, "parse_image",
+        prefill="{",
     )
 
 
@@ -238,5 +254,5 @@ async def parse_when(text: str, now: datetime, tz: str) -> dict:
     """
     return await _ask(
         _system_blocks(WHEN_SYSTEM, now, tz, cacheable=False),
-        text, config.LLM_MODEL_FAST, 300, "parse_when",
+        text, config.LLM_MODEL_FAST, 300, "parse_when", prefill="{",
     )
