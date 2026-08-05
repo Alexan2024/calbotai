@@ -15,7 +15,9 @@ writable-календари; запись идёт в выбранный (или
 iCloud эта проверка не выполняется (лишние запросы, поведение не меняем).
 """
 from __future__ import annotations
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, date
 
 import caldav
@@ -231,11 +233,16 @@ class UserCalDAV:
         except Exception:
             self.tz = DEFAULT_TZ
         self._cals: dict[str, "caldav.Calendar"] | None = None  # имя -> календарь
+        self._cal_urls: dict[str, str] = {}                      # имя -> URL календаря
+        self._events_cache: dict = {}                            # ключ окна -> (expiry, события)
 
     # --- подключение ---
 
     def _reset(self):
         self._cals = None
+        self._cal_urls = {}
+        # events-кэш при сетевом reset не трогаем: у него свой TTL, данные ещё валидны.
+        # Он чистится только на записи (_invalidate_events).
 
     def _client(self) -> caldav.DAVClient:
         return caldav.DAVClient(
@@ -254,9 +261,57 @@ class UserCalDAV:
         if not cals:
             raise RuntimeError("Не найдено календарей для событий (VEVENT).")
         self._cals = {}
+        self._cal_urls = {}
         for c in cals:
-            self._cals[_norm_name(c.name) or "?"] = c
+            nm = _norm_name(c.name) or "?"
+            self._cals[nm] = c
+            try:
+                self._cal_urls[nm] = str(c.url)
+            except Exception:
+                pass  # без URL просто не пойдём по параллельному пути для этого календаря
         return self._cals
+
+    def _fresh_calendar(self, url: str) -> "caldav.Calendar":
+        """Календарь по известному URL на СВЕЖЕМ DAVClient.
+
+        Для параллельного чтения каждому потоку нужен свой клиент: requests.Session
+        внутри caldav не потокобезопасна, а principal-discovery мы пропускаем —
+        URL уже закэширован (_cal_urls)."""
+        return caldav.Calendar(client=self._client(), url=url)
+
+    # --- events-кэш (короткий TTL, чтобы повторные окна отдавались мгновенно) ---
+
+    def _events_key(self, dt_from: datetime, dt_to: datetime,
+                    calendar_name: str | None) -> tuple:
+        a = _aware(dt_from, self.tz).astimezone(pytz.utc).replace(microsecond=0)
+        b = _aware(dt_to, self.tz).astimezone(pytz.utc).replace(microsecond=0)
+        return (calendar_name or "*", a.isoformat(), b.isoformat())
+
+    def _cache_get(self, key: tuple):
+        ttl = config.EVENTS_CACHE_TTL
+        if ttl <= 0:
+            return None
+        hit = self._events_cache.get(key)
+        if not hit:
+            return None
+        exp, data = hit
+        if exp < time.monotonic():
+            self._events_cache.pop(key, None)
+            return None
+        return list(data)  # копия: вызывающий код иногда фильтрует список
+
+    def _cache_put(self, key: tuple, data: list):
+        ttl = config.EVENTS_CACHE_TTL
+        if ttl <= 0:
+            return
+        self._events_cache[key] = (time.monotonic() + ttl, list(data))
+        if len(self._events_cache) > 64:  # лёгкая уборка протухших ключей
+            nowm = time.monotonic()
+            for k in [k for k, (e, _) in self._events_cache.items() if e < nowm]:
+                self._events_cache.pop(k, None)
+
+    def _invalidate_events(self):
+        self._events_cache.clear()
 
     def _default(self) -> tuple[str, "caldav.Calendar"]:
         cals = self._calendars()
@@ -331,7 +386,9 @@ class UserCalDAV:
             uid, ical = _build_ical(ev, self.tz)
             calendar.save_event(ical.decode())
             return uid, name
-        return self._retry(op)
+        res = self._retry(op)
+        self._invalidate_events()
+        return res
 
     def delete_event(self, uid: str, calendar_name: str | None = None) -> bool:
         def op() -> bool:
@@ -340,7 +397,9 @@ class UserCalDAV:
                 return False
             obj.delete()
             return True
-        return self._retry(op)
+        res = self._retry(op)
+        self._invalidate_events()
+        return res
 
     def update_event(self, uid: str, new: Event, calendar_name: str | None = None) -> bool:
         def op() -> bool:
@@ -352,7 +411,9 @@ class UserCalDAV:
             obj.data = ical.decode()
             obj.save()
             return True
-        return self._retry(op)
+        res = self._retry(op)
+        self._invalidate_events()
+        return res
 
     def get_event(self, uid: str, calendar_name: str | None = None) -> dict | None:
         """Прочитать одно событие целиком (с заметками, напоминаниями, повтором)."""
@@ -367,35 +428,69 @@ class UserCalDAV:
             return None
         return self._retry(op)
 
+    def _search_one(self, name: str, c, dt_from: datetime, dt_to: datetime) -> list[dict]:
+        """Поиск в одном календаре. Ошибку одного календаря глушим — он не должен
+        ронять чтение остальных (поведение как раньше)."""
+        try:
+            results = c.search(
+                start=_aware(dt_from, self.tz),
+                end=_aware(dt_to, self.tz),
+                event=True,
+                expand=True,
+            )
+        except Exception:
+            return []
+        found = []
+        for r in results:
+            for comp in r.icalendar_instance.walk("VEVENT"):
+                d = _parse_component(comp)
+                d["calendar"] = name
+                found.append(d)
+        return found
+
     def list_events(self, dt_from: datetime, dt_to: datetime,
                     calendar_name: str | None = None) -> list[dict]:
         """События за период. По умолчанию — по ВСЕМ календарям, каждое событие
-        помечается полем "calendar". calendar_name сужает до одного."""
+        помечается полем "calendar". calendar_name сужает до одного.
+
+        Одинаковые окна отдаются из TTL-кэша; чтение по нескольким календарям
+        распараллеливается (свой DAVClient на поток)."""
+        key = self._events_key(dt_from, dt_to, calendar_name)
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+
         def op():
             if calendar_name:
                 name, c = self._by_name(calendar_name)
-                targets = [(name, c)]
-            else:
-                targets = list(self._calendars().items())
+                return self._search_one(name, c, dt_from, dt_to)
+
+            cals = self._calendars()
+            names = list(cals.keys())
+
+            if config.CALDAV_PARALLEL and len(names) > 1:
+                def worker(name):
+                    url = self._cal_urls.get(name)
+                    # у каждого потока свой клиент; если URL не закэширован —
+                    # запасной путь через общий (последовательный) объект календаря
+                    c = self._fresh_calendar(url) if url else cals[name]
+                    return self._search_one(name, c, dt_from, dt_to)
+
+                found = []
+                with ThreadPoolExecutor(max_workers=min(len(names), 8)) as ex:
+                    for part in ex.map(worker, names):
+                        found.extend(part)
+                return found
+
+            # последовательный путь (один календарь / параллель выключена)
             found = []
-            for name, c in targets:
-                try:
-                    results = c.search(
-                        start=_aware(dt_from, self.tz),
-                        end=_aware(dt_to, self.tz),
-                        event=True,
-                        expand=True,
-                    )
-                except Exception:
-                    continue  # один капризный календарь не должен ронять всё
-                for r in results:
-                    for comp in r.icalendar_instance.walk("VEVENT"):
-                        d = _parse_component(comp)
-                        d["calendar"] = name
-                        found.append(d)
+            for name in names:
+                found.extend(self._search_one(name, cals[name], dt_from, dt_to))
             return found
+
         out = self._retry(op)
         out.sort(key=lambda e: _sort_key(e["start"], self.tz))
+        self._cache_put(key, out)
         return out
 
     def find_by_title(self, title: str, dt_from: datetime, dt_to: datetime) -> list[dict]:
