@@ -49,6 +49,11 @@ PERF_LOG = os.environ.get("PERF_LOG", "false").lower() == "true"
 # Работает, только если LLM_MODEL_FAST реально задан и отличается от LLM_MODEL;
 # иначе обе ветки используют одну модель и поведение не меняется.
 LLM_FAST_MAXLEN = int(os.environ.get("LLM_FAST_MAXLEN", "200"))
+# Префилл ответа ассистента символом "{" (чуть быстрее и надёжнее по JSON).
+# ВЫКЛ по умолчанию: не все модели поддерживают assistant-prefill — при отказе
+# API возвращает 400 "does not support assistant message prefill". Включай только
+# на модели, которая это умеет.
+LLM_PREFILL = os.environ.get("LLM_PREFILL", "false").lower() == "true"
 
 # Распознавание речи: openai | groq | none
 STT_PROVIDER = os.environ.get("STT_PROVIDER", "openai").lower()
