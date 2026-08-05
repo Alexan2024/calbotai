@@ -437,6 +437,28 @@ async def _conflict_warning(user_id: int, ev: Event, tz) -> str:
     return out
 
 
+async def _attach_conflict_warning(sent_msg, token: str, user_id: int, ev: Event, tz):
+    """Посчитать дубли/пересечения в фоне и, если они есть, дорисовать карточку.
+
+    Показ карточки этим не блокируется (раньше проверка добавляла +1–3 c к ожиданию).
+    Перерисовка идёт через _render_create_card, поэтому подхватывает тоглы напоминаний
+    и выбранный календарь, если пользователь успел их поменять."""
+    try:
+        warn = await _conflict_warning(user_id, ev, tz)
+    except Exception:
+        return
+    if not warn:
+        return
+    data = PENDING.get(token)
+    if not data:  # пользователь уже подтвердил/отменил — карточки больше нет
+        return
+    data["warn"] = warn
+    try:
+        await _render_create_card(sent_msg, token, tz, edit=True)
+    except Exception:
+        pass  # сообщение изменено/удалено параллельно — не критично
+
+
 # ---------- разбор результата LLM ----------
 
 async def handle_parsed(message: Message, parsed: dict, u: dict):
@@ -451,13 +473,16 @@ async def handle_parsed(message: Message, parsed: dict, u: dict):
         for ed in events:
             ev = event_from_llm(ed, tz)
             token = new_token()
-            warn = await _conflict_warning(u["user_id"], ev, tz)
             PENDING[token] = {"action": "create", "event": ev.to_dict(),
                               "user_id": u["user_id"], "chat_id": message.chat.id,
-                              "calendar": None, "warn": warn}
-            await message.answer(
-                event_card(ev, tz) + warn + "\n\nДобавить в календарь?",
+                              "calendar": None, "warn": ""}
+            sent = await message.answer(
+                event_card(ev, tz) + "\n\nДобавить в календарь?",
                 reply_markup=create_confirm_kb(token, set(ev.reminders_minutes)),
+            )
+            # дубли/пересечения считаем в фоне и дорисовываем карточку — не ждём CalDAV
+            asyncio.create_task(
+                _attach_conflict_warning(sent, token, u["user_id"], ev, tz)
             )
 
     elif intent == "query":
