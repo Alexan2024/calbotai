@@ -44,6 +44,11 @@ LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "2048"))
 LLM_MODEL_FAST = os.environ.get("LLM_MODEL_FAST", "").strip() or LLM_MODEL
 # Логировать тайминги и токены каждого вызова LLM в stdout (строки "[perf] ...").
 PERF_LOG = os.environ.get("PERF_LOG", "false").lower() == "true"
+# Маршрутизация модели по длине ввода: короткий текст (<= порога, без картинки)
+# разбирается быстрой моделью LLM_MODEL_FAST, длинные форварды — основной LLM_MODEL.
+# Работает, только если LLM_MODEL_FAST реально задан и отличается от LLM_MODEL;
+# иначе обе ветки используют одну модель и поведение не меняется.
+LLM_FAST_MAXLEN = int(os.environ.get("LLM_FAST_MAXLEN", "200"))
 
 # Распознавание речи: openai | groq | none
 STT_PROVIDER = os.environ.get("STT_PROVIDER", "openai").lower()
@@ -72,6 +77,11 @@ CALDAV_URLS = {
 }
 DEFAULT_PROVIDER = "icloud"
 
+# Читать календари параллельно (по потоку с отдельным DAVClient на календарь).
+# Ускоряет list_events при нескольких календарях. Отключается на случай, если
+# какой-то провайдер плохо переносит параллельные подключения.
+CALDAV_PARALLEL = os.environ.get("CALDAV_PARALLEL", "true").lower() == "true"
+
 TIMEZONE = os.environ.get("TIMEZONE", "Europe/Moscow")  # пояс по умолчанию
 DEFAULT_REMINDERS = _int_list(os.environ.get("DEFAULT_REMINDERS", "60,10"))
 TELEGRAM_REMINDERS = os.environ.get("TELEGRAM_REMINDERS", "true").lower() == "true"
@@ -82,5 +92,11 @@ DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR", "8"))
 # Рабочее окно для поиска свободных слотов («найди час на этой неделе»).
 WORKDAY_START = int(os.environ.get("WORKDAY_START", "9"))
 WORKDAY_END = int(os.environ.get("WORKDAY_END", "21"))
+
+# TTL кэша прочитанных событий (секунды). Одно и то же окно (проверка дублей,
+# повторный «что у меня завтра», дайджест) отдаётся из памяти. 0 — выключить.
+# Кэш сбрасывается на любой записи (create/update/delete), так что свежесозданные
+# события в ответах не теряются.
+EVENTS_CACHE_TTL = int(os.environ.get("EVENTS_CACHE_TTL", "45"))
 
 DB_PATH = os.environ.get("DB_PATH", "tgcalbot.sqlite3")
