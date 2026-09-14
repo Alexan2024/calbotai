@@ -1331,6 +1331,39 @@ async def on_photo(message: Message, bot: Bot):
     await handle_parsed(message, parsed, u)
 
 
+@dp.message(F.document)
+async def on_document(message: Message, bot: Bot):
+    # Картинка, присланная «как файл» (без сжатия) — частый случай при пересылке.
+    # Telegram отдаёт её как document, а не photo, поэтому обычный фото-хендлер
+    # её не ловит. Если это изображение — гоним по тому же пути, что и фото.
+    u = await ensure_ready(message)
+    if not u:
+        return
+    doc = message.document
+    mime = (doc.mime_type or "").lower()
+    if not mime.startswith("image/"):
+        await message.answer(
+            "Это файл, но не картинка. Пришли афишу картинкой или событие текстом 🙂"
+        )
+        return
+    # Claude принимает jpeg/png/gif/webp; для прочего мягко откатываемся на jpeg.
+    media_type = mime if mime in (
+        "image/jpeg", "image/png", "image/gif", "image/webp"
+    ) else "image/jpeg"
+    buf = io.BytesIO()
+    await bot.download(doc.file_id, destination=buf)
+    tzname = user_tz_name(u)
+    try:
+        parsed = await llm.parse_image(
+            buf.getvalue(), message.caption or "",
+            now(user_tz(u["user_id"])), tzname, media_type=media_type,
+        )
+    except Exception as e:
+        await message.answer(f"⚠️ Не разобрал изображение: {e}")
+        return
+    await handle_parsed(message, parsed, u)
+
+
 @dp.message(F.text)
 async def on_text(message: Message, bot: Bot):
     uid = message.from_user.id
@@ -1350,6 +1383,19 @@ async def on_text(message: Message, bot: Bot):
     tzname = user_tz_name(u)
     parsed = await llm.parse_text(message.text, now(user_tz(uid)), tzname)
     await handle_parsed(message, parsed, u)
+
+
+@dp.message()
+async def on_unknown(message: Message, bot: Bot):
+    # Запасной обработчик: всё, что не попало выше (видео, стикер, гео и т.п.).
+    # Раньше такие сообщения молча терялись — теперь бот всегда отвечает.
+    u = await ensure_ready(message)
+    if not u:
+        return
+    await message.answer(
+        "Не понял такой формат 🤔 Пришли событие текстом, голосом, "
+        "картинкой афиши или скриншотом."
+    )
 
 
 async def handle_setup_text(message: Message, pending: dict, bot: Bot):
