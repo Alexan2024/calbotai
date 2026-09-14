@@ -460,23 +460,57 @@ class UserCalDAV:
             self._reset()
             return op()
 
-    def _find_object(self, uid: str, calendar_name: str | None):
-        """Найти объект события: сперва в подсказанном календаре, затем во всех."""
-        tried = set()
+    def _find_object(self, uid: str, calendar_name: str | None,
+                     around: datetime | None = None):
+        """Найти объект события.
+
+        Сначала точечный запрос по UID; если сервер его не поддерживает
+        (iCloud отвечает 412 на UID-фильтр — известная странность), падение
+        одного календаря не роняет поиск, а после всех промахов включается
+        запасной путь: выборка за период времени + сверка UID у нас.
+        around — подсказка, где событие во времени; без неё запасной путь
+        смотрит окно [-7 дней .. +60 дней].
+        """
+        ordered: list[tuple[str, "caldav.Calendar"]] = []
         if calendar_name:
             name, c = self._by_name(calendar_name)
-            tried.add(name)
-            try:
-                return c.event_by_uid(uid), name
-            except caldav.error.NotFoundError:
-                pass
+            ordered.append((name, c))
         for name, c in self._calendars().items():
-            if name in tried:
-                continue
+            if not any(name == n for n, _ in ordered):
+                ordered.append((name, c))
+
+        # 1) точечный запрос по UID — быстрый, но не все серверы его умеют
+        for name, c in ordered:
             try:
                 return c.event_by_uid(uid), name
             except caldav.error.NotFoundError:
                 continue
+            except Exception:
+                continue  # 412 и прочие капризы сервера -> запасной путь ниже
+
+        # 2) запасной путь: время + сверка UID на нашей стороне
+        if around is not None and not isinstance(around, datetime):
+            around = datetime.combine(around, datetime.min.time())
+        if around is not None:
+            lo, hi = around - timedelta(days=1), around + timedelta(days=2)
+        else:
+            ref = datetime.now(self.tz)
+            lo, hi = ref - timedelta(days=7), ref + timedelta(days=60)
+        for name, c in ordered:
+            try:
+                # без expand: нужны реальные хранимые объекты (их можно сохранять),
+                # а не развёрнутые копии вхождений
+                results = c.search(start=_aware(lo, self.tz),
+                                   end=_aware(hi, self.tz), event=True)
+            except Exception:
+                continue
+            for r in results:
+                try:
+                    comps = r.icalendar_instance.walk("VEVENT")
+                except Exception:
+                    continue
+                if any(str(comp.get("UID")) == uid for comp in comps):
+                    return r, name
         return None, None
 
     # --- публичное API ---
@@ -498,9 +532,10 @@ class UserCalDAV:
         self._invalidate_events()
         return res
 
-    def delete_event(self, uid: str, calendar_name: str | None = None) -> bool:
+    def delete_event(self, uid: str, calendar_name: str | None = None,
+                     around: datetime | None = None) -> bool:
         def op() -> bool:
-            obj, _ = self._find_object(uid, calendar_name)
+            obj, _ = self._find_object(uid, calendar_name, around)
             if obj is None:
                 return False
             obj.delete()
@@ -509,11 +544,12 @@ class UserCalDAV:
         self._invalidate_events()
         return res
 
-    def update_event(self, uid: str, new: Event, calendar_name: str | None = None) -> bool:
+    def update_event(self, uid: str, new: Event, calendar_name: str | None = None,
+                     around: datetime | None = None) -> bool:
         """Обновить событие ПО МЕСТУ: только управляемые поля, остальное
         (участники, организатор, ссылки на созвон, исключения серии) сохраняется."""
         def op() -> bool:
-            obj, _ = self._find_object(uid, calendar_name)
+            obj, _ = self._find_object(uid, calendar_name, around)
             if obj is None:
                 return False
             ical = obj.icalendar_instance
@@ -533,7 +569,7 @@ class UserCalDAV:
                            calendar_name: str | None = None) -> bool:
         """Убрать одно вхождение повторяющейся серии (EXDATE), серию не трогая."""
         def op() -> bool:
-            obj, _ = self._find_object(uid, calendar_name)
+            obj, _ = self._find_object(uid, calendar_name, around=occ_start)
             if obj is None:
                 return False
             ical = obj.icalendar_instance
@@ -549,10 +585,11 @@ class UserCalDAV:
         self._invalidate_events()
         return res
 
-    def get_event(self, uid: str, calendar_name: str | None = None) -> dict | None:
+    def get_event(self, uid: str, calendar_name: str | None = None,
+                  around: datetime | None = None) -> dict | None:
         """Прочитать одно событие целиком (с заметками, напоминаниями, повтором)."""
         def op():
-            obj, name = self._find_object(uid, calendar_name)
+            obj, name = self._find_object(uid, calendar_name, around)
             if obj is None:
                 return None
             comp = _master_component(obj.icalendar_instance)
