@@ -880,7 +880,10 @@ async def _stage_edit(msg: Message, target: dict, changes: dict, op: str, u: dic
     try:
         client = cal.for_user(u["user_id"])
         cal_hint = target.get("cal") or target.get("calendar")
-        base = await asyncio.to_thread(client.get_event, target["uid"], cal_hint)
+        t_start = target.get("start")
+        around = _to_dt(t_start, tz) if t_start is not None else None
+        base = await asyncio.to_thread(client.get_event, target["uid"], cal_hint,
+                                       around)
     except Exception as e:
         await out(f"⚠️ Не смог прочитать календарь: {e}")
         return
@@ -1051,7 +1054,9 @@ async def cb_scope_all(cq: CallbackQuery):
     await cq.message.edit_text("⏳ Применяю…")
     try:
         if data["action"] == "edel":
-            ok = await asyncio.to_thread(client.delete_event, data["uid"], data.get("cal"))
+            occ = datetime.fromisoformat(data["occ_start"]) if data.get("occ_start") else None
+            ok = await asyncio.to_thread(client.delete_event, data["uid"],
+                                         data.get("cal"), occ)
             if ok:
                 store.remove(data["uid"])
                 await cq.message.edit_text("🗑 Серия удалена." if data.get("recurring")
@@ -1060,7 +1065,9 @@ async def cb_scope_all(cq: CallbackQuery):
                 await cq.message.edit_text("⚠️ Событие не найдено (возможно, уже удалено).")
             return
         ev = Event.from_dict(data["series"])
-        ok = await asyncio.to_thread(client.update_event, data["uid"], ev, data.get("cal"))
+        occ = datetime.fromisoformat(data["occ_start"]) if data.get("occ_start") else None
+        ok = await asyncio.to_thread(client.update_event, data["uid"], ev,
+                                     data.get("cal"), occ)
         if ok:
             store.update_start(data["uid"], ev.title, ev.start)
             remember_events(data["chat_id"], [{"title": ev.title, "start": ev.start,
@@ -2435,7 +2442,7 @@ async def on_ok(cq: CallbackQuery):
             )
         else:  # edit
             ok = await asyncio.to_thread(
-                client.update_event, data["uid"], ev, data.get("cal")
+                client.update_event, data["uid"], ev, data.get("cal"), ev.start
             )
             if ok:
                 store.update_start(data["uid"], ev.title, ev.start)
