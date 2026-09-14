@@ -18,7 +18,8 @@
   "events": [ {title, category, start, end, all_day, location, notes,
                reminders_minutes, recurrence} ],
   "query": {"from": ISO, "to": ISO} | null,
-  "edit": {"match_title": str, "changes": {...}} | null,
+  "edit": {"match_title", "match_hint": {from, to, part_of_day},
+           "op": "modify"|"delete", "changes": {...}} | null,
   "slot": {"title", "duration_minutes", "from", "to"} | null,
   "bulk": {"op", "from", "to", "match_title", "shift_minutes"} | null,
   "reply": "строка или null"
@@ -69,7 +70,14 @@ STATIC_SYSTEM = """Ты — движок разбора для календар�
     }
   ],
   "query": {"from": "ISO", "to": "ISO"} | null,
-  "edit": {"match_title": "строка", "changes": { поля события }} | null,
+  "edit": {"match_title": "строка или null",
+           "match_hint": {"from": "ISO или null", "to": "ISO или null",
+                          "part_of_day": "morning|afternoon|evening|night или null"},
+           "op": "modify" | "delete",
+           "changes": { поля события, а также
+                        "shift_minutes": число или null,
+                        "duration_minutes": число или null,
+                        "part_of_day": "morning|afternoon|evening|night или null" }} | null,
   "slot": {"title": "строка или null", "duration_minutes": число,
            "from": "ISO или null", "to": "ISO или null"} | null,
   "bulk": {"op": "delete" | "shift", "from": "ISO", "to": "ISO",
@@ -81,8 +89,22 @@ STATIC_SYSTEM = """Ты — движок разбора для календар�
 - intent=create — если пользователь описывает событие/встречу/дедлайн/афишу.
 - intent=query — если спрашивает про расписание («что у меня завтра», «планы на неделю»).
   Заполни query.from и query.to границами периода; events оставь пустым.
-- intent=edit — если просит изменить/перенести/удалить ОДНО конкретное событие.
-  В edit.match_title — как назвать искомое событие; в edit.changes — новые значения.
+- intent=edit — если просит изменить/перенести/переименовать/удалить ОДНО конкретное
+  событие: «перенеси врача на 18», «утренняя встреча перенеслась на вечер»,
+  «отмени тренировку», «созвон будет на полчаса позже».
+  op=delete — если событие нужно отменить/удалить; иначе op=modify.
+  match_title — как пользователь называет событие; можно описательно
+  («утренняя встреча»), бот сам сопоставит с реальным названием.
+  match_hint — где искать событие: from/to — границы периода, если он назван
+  («завтрашний созвон» → завтра; «встреча в четверг» → четверг); part_of_day —
+  если событие описано частью дня («утренняя»). Не назван период — оставь null.
+  changes — ТОЛЬКО то, что меняется:
+  * точное новое время → start (и end, если назван конец);
+  * относительный сдвиг («на полчаса позже», «на час раньше») → shift_minutes
+    (отрицательное = раньше); start при этом НЕ заполняй;
+  * неточная цель («на вечер», «на утро») → changes.part_of_day; start НЕ
+    заполняй и точное время НЕ выдумывай;
+  * новая длительность («поставь на два часа») → duration_minutes.
 - intent=find_slot — если просит найти свободное время («найди час на этой неделе
   для встречи», «когда я свободен завтра на 30 минут»). duration_minutes — длительность
   (по умолчанию 60), from/to — границы поиска (null = ближайшая неделя),
@@ -136,6 +158,9 @@ STATIC_SYSTEM = """Ты — движок разбора для календар�
 - reminders_minutes оставляй пустым, если пользователь явно не просил напоминание.
 - Может быть несколько событий — верни их все.
 - Если пользователь задаёт вопрос про его планы, занятость и т.д. — анализируй и отвечай.
+- Перед сообщением может идти блок «Недавно показанные события» — используй его,
+  чтобы понять ссылки («её», «это», «вторую», «перенеси её на час»): в match_title
+  подставь настоящее название события из контекста, в match_hint — его дату.
 """
 
 WHEN_SYSTEM = """Ты извлекаешь дату и время из короткой фразы пользователя для переноса
@@ -147,6 +172,22 @@ WHEN_SYSTEM = """Ты извлекаешь дату и время из коро�
 
 Если названо только время без даты — возьми ближайшую подходящую дату (сегодня, если
 время ещё не прошло, иначе завтра). Если названа только дата без времени — all_day=true."""
+
+RESOLVE_SYSTEM = """Ты выбираешь, какое из СУЩЕСТВУЮЩИХ событий календаря пользователь
+имеет в виду. Тебе дают его фразу и пронумерованный список реальных событий.
+Текущий момент и часовой пояс даны отдельным блоком ниже.
+
+Верни СТРОГО один JSON-объект без markdown:
+{"pick": номер или null, "candidates": [номера] или null}
+
+Правила:
+- pick — если по смыслу однозначно понятно, какое событие имеется в виду.
+  Сопоставляй по смыслу, а не по буквам: «утренняя встреча» = встреча/созвон в
+  первой половине дня; «врач» = событие про здоровье; «тренировка» = спорт;
+  «ужин с Лёшей» = еда/встреча с этим именем, и т.п.
+- candidates — если разумно подходят несколько (2–6 номеров); pick тогда null.
+- Если не подходит ни одно — pick=null и candidates=null. Не выбирай наугад.
+"""
 
 
 def _now_block(now: datetime, tz: str) -> dict:
@@ -219,15 +260,32 @@ async def _ask(system_blocks: list[dict], user_content, model: str,
     return _extract_json(resp, prefill)
 
 
-async def parse_text(text: str, now: datetime, tz: str) -> dict:
+async def parse_text(text: str, now: datetime, tz: str,
+                     context: str | None = None) -> dict:
     # короткие сообщения -> быстрая модель; длинные форварды -> основная.
     # LLM_MODEL_FAST по умолчанию == LLM_MODEL, поэтому без явной настройки
     # окружения поведение не меняется.
+    # Маршрутизация — по длине САМОГО сообщения: контекст диалога её не раздувает.
     model = (config.LLM_MODEL_FAST
              if len(text) <= config.LLM_FAST_MAXLEN else config.LLM_MODEL)
+    payload = f"{context}\n---\nСообщение пользователя: {text}" if context else text
     return await _ask(
         _system_blocks(STATIC_SYSTEM, now, tz, cacheable=True),
-        text, model, config.LLM_MAX_TOKENS, "parse_text", prefill="{",
+        payload, model, config.LLM_MAX_TOKENS, "parse_text", prefill="{",
+    )
+
+
+async def resolve_edit(text: str, candidates: str, now: datetime, tz: str) -> dict:
+    """Второй шаг текстовой правки: выбрать событие из списка РЕАЛЬНЫХ.
+
+    Модель видит фразу пользователя и настоящие события календаря, поэтому
+    «утренняя встреча» сопоставляется с «Созвон с командой» в 09:00 по смыслу.
+    Задача мелкая — быстрая модель; промпт короткий, кэшировать нечего.
+    """
+    user = f"Фраза пользователя: «{text}»\n\nСобытия:\n{candidates}"
+    return await _ask(
+        _system_blocks(RESOLVE_SYSTEM, now, tz, cacheable=False),
+        user, config.LLM_MODEL_FAST, 400, "resolve_edit", prefill="{",
     )
 
 
