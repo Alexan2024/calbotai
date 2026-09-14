@@ -231,14 +231,15 @@ async def parse_text(text: str, now: datetime, tz: str) -> dict:
     )
 
 
-async def parse_image(image_bytes: bytes, caption: str, now: datetime, tz: str) -> dict:
+async def parse_image(image_bytes: bytes, caption: str, now: datetime, tz: str,
+                      media_type: str = "image/jpeg") -> dict:
     b64 = base64.b64encode(image_bytes).decode()
     prompt = caption or "Извлеки событие(я) с этого изображения (афиша/скриншот)."
     user_content = [
         {"type": "text", "text": prompt},
         {
             "type": "image",
-            "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
+            "source": {"type": "base64", "media_type": media_type, "data": b64},
         },
     ]
     return await _ask(
