@@ -13,6 +13,12 @@ writable-календари; запись идёт в выбранный (или
 Особенность Google: подписные/праздничные календари тоже принимают VEVENT,
 но read-only — они отфильтровываются по current-user-privilege-set. Для
 iCloud эта проверка не выполняется (лишние запросы, поведение не меняем).
+
+Правки (update_event) идут ПО МЕСТУ: меняются только управляемые поля
+(название, время, место, заметки, напоминания, RRULE), всё остальное —
+участники, организатор, ссылки на видеозвонок, вложения, исключения серии —
+сохраняется как есть. Раньше iCal пересобирался с нуля и эти поля молча
+уничтожались. exclude_occurrence убирает одно вхождение серии через EXDATE.
 """
 from __future__ import annotations
 import time
@@ -132,6 +138,112 @@ def _aware(dt: datetime, tz) -> datetime:
     return tz.localize(dt) if dt.tzinfo is None else dt
 
 
+def _managed_alarms(ev: Event) -> list[Alarm]:
+    """Наши DISPLAY-напоминания из reminders_minutes."""
+    out = []
+    for minutes in ev.reminders_minutes:
+        alarm = Alarm()
+        alarm.add("action", "DISPLAY")
+        alarm.add("description", ev.title)
+        alarm.add("trigger", timedelta(minutes=-abs(minutes)))
+        out.append(alarm)
+    return out
+
+
+def _master_component(ical):
+    """Мастер-VEVENT серии (без RECURRENCE-ID); для обычного события — сам VEVENT.
+
+    В объекте повторяющегося события кроме мастера могут лежать компоненты-
+    исключения (перенесённые вхождения) — их трогать нельзя.
+    """
+    comps = list(ical.walk("VEVENT"))
+    if not comps:
+        return None
+    for c in comps:
+        if c.get("RECURRENCE-ID") is None:
+            return c
+    return comps[0]
+
+
+def _bump_meta(comp) -> None:
+    """SEQUENCE+1 и свежий DTSTAMP — чтобы клиенты подхватили правку."""
+    try:
+        seq = int(comp.get("SEQUENCE", 0) or 0)
+    except (TypeError, ValueError):
+        seq = 0
+    comp.pop("SEQUENCE", None)
+    comp.add("SEQUENCE", seq + 1)
+    comp.pop("DTSTAMP", None)
+    comp.add("DTSTAMP", datetime.now(pytz.utc))
+    comp.pop("LAST-MODIFIED", None)
+    comp.add("LAST-MODIFIED", datetime.now(pytz.utc))
+
+
+def _patch_vevent(comp, ev: Event, tz) -> None:
+    """Обновить существующий VEVENT по месту.
+
+    Меняем только управляемые поля; ATTENDEE/ORGANIZER/ссылки на созвон/
+    X-поля/вложения не трогаем. DURATION убираем всегда: мы пишем DTEND,
+    а по RFC они взаимоисключающие.
+    """
+    comp.pop("SUMMARY", None)
+    comp.add("SUMMARY", ev.title)
+
+    comp.pop("DTSTART", None)
+    comp.pop("DTEND", None)
+    comp.pop("DURATION", None)
+    if ev.all_day:
+        d = ev.start.date() if isinstance(ev.start, datetime) else ev.start
+        comp.add("DTSTART", d)
+        comp.add("DTEND", d + timedelta(days=1))
+    else:
+        start = _aware(ev.start, tz)
+        end = _aware(ev.end, tz) if ev.end else start + timedelta(hours=1)
+        comp.add("DTSTART", start)
+        comp.add("DTEND", end)
+
+    comp.pop("LOCATION", None)
+    if ev.location:
+        comp.add("LOCATION", ev.location)
+    comp.pop("DESCRIPTION", None)
+    if ev.notes:
+        comp.add("DESCRIPTION", ev.notes)
+
+    comp.pop("RRULE", None)
+    if ev.recurrence:
+        try:
+            comp.add("RRULE", vRecur.from_ical(ev.recurrence))
+        except Exception:
+            pass  # кривой RRULE — оставляем событие без повтора
+
+    # наши напоминания заменяем целиком (их же мы и читаем в reminders_minutes)
+    comp.subcomponents = [c for c in comp.subcomponents if c.name != "VALARM"]
+    for alarm in _managed_alarms(ev):
+        comp.add_component(alarm)
+
+    _bump_meta(comp)
+
+
+def _add_exdate(comp, occ_start, default_tz) -> None:
+    """Добавить EXDATE для одного вхождения серии.
+
+    Форма значения подгоняется под DTSTART мастера: для all-day серии — дата,
+    для timed — datetime в ТОМ ЖЕ поясе, что DTSTART (одинаковая форма TZID —
+    самый совместимый вариант для iCloud/Google).
+    """
+    dtstart = comp.get("DTSTART")
+    ref = getattr(dtstart, "dt", None) if dtstart is not None else None
+    value = occ_start
+    if ref is not None and not isinstance(ref, datetime):
+        value = occ_start.date() if isinstance(occ_start, datetime) else occ_start
+    elif isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = default_tz.localize(value)
+        if isinstance(ref, datetime) and ref.tzinfo is not None:
+            value = value.astimezone(ref.tzinfo)
+    comp.add("EXDATE", value)
+
+
 def _build_ical(ev: Event, tz) -> tuple[str, bytes]:
     """Собрать VEVENT (+ VALARM, + RRULE) и вернуть (uid, ical_bytes)."""
     cal = ICalendar()
@@ -165,11 +277,7 @@ def _build_ical(ev: Event, tz) -> tuple[str, bytes]:
         except Exception:
             pass  # кривой RRULE от LLM — событие создаём без повтора
 
-    for minutes in ev.reminders_minutes:
-        alarm = Alarm()
-        alarm.add("action", "DISPLAY")
-        alarm.add("description", ev.title)
-        alarm.add("trigger", timedelta(minutes=-abs(minutes)))
+    for alarm in _managed_alarms(ev):
         ie.add_component(alarm)
 
     cal.add_component(ie)
@@ -402,13 +510,39 @@ class UserCalDAV:
         return res
 
     def update_event(self, uid: str, new: Event, calendar_name: str | None = None) -> bool:
+        """Обновить событие ПО МЕСТУ: только управляемые поля, остальное
+        (участники, организатор, ссылки на созвон, исключения серии) сохраняется."""
         def op() -> bool:
             obj, _ = self._find_object(uid, calendar_name)
             if obj is None:
                 return False
+            ical = obj.icalendar_instance
+            comp = _master_component(ical)
+            if comp is None:
+                return False
             new.uid = uid
-            _, ical = _build_ical(new, self.tz)
-            obj.data = ical.decode()
+            _patch_vevent(comp, new, self.tz)
+            obj.data = ical.to_ical().decode()
+            obj.save()
+            return True
+        res = self._retry(op)
+        self._invalidate_events()
+        return res
+
+    def exclude_occurrence(self, uid: str, occ_start: datetime,
+                           calendar_name: str | None = None) -> bool:
+        """Убрать одно вхождение повторяющейся серии (EXDATE), серию не трогая."""
+        def op() -> bool:
+            obj, _ = self._find_object(uid, calendar_name)
+            if obj is None:
+                return False
+            ical = obj.icalendar_instance
+            comp = _master_component(ical)
+            if comp is None:
+                return False
+            _add_exdate(comp, occ_start, self.tz)
+            _bump_meta(comp)
+            obj.data = ical.to_ical().decode()
             obj.save()
             return True
         res = self._retry(op)
@@ -421,11 +555,12 @@ class UserCalDAV:
             obj, name = self._find_object(uid, calendar_name)
             if obj is None:
                 return None
-            for comp in obj.icalendar_instance.walk("VEVENT"):
-                d = _parse_component(comp)
-                d["calendar"] = name
-                return d
-            return None
+            comp = _master_component(obj.icalendar_instance)
+            if comp is None:
+                return None
+            d = _parse_component(comp)
+            d["calendar"] = name
+            return d
         return self._retry(op)
 
     def _search_one(self, name: str, c, dt_from: datetime, dt_to: datetime) -> list[dict]:
