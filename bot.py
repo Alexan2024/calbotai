@@ -15,7 +15,11 @@ UX кнопочный: постоянная reply-клавиатура, инла
 дайджест/статистика) идёт по ВСЕМ календарям; повторяющиеся события (RRULE);
 утренний дайджест; кнопки на пинге напоминания (+15 мин / карточка);
 детектор пересечений; поиск свободного слота; undo после создания;
-массовые операции («отмени всё в пятницу»); статистика за неделю.
+массовые операции («отмени всё в пятницу»); статистика за неделю;
+текстовые правки v2 — двухступенчатый выбор события по смыслу («утренняя
+встреча перенеслась на вечер»), дифф «было → станет», кнопки при
+неоднозначности, удаление текстом, «только это вхождение / вся серия»
+для повторяющихся, краткая память диалога («перенеси её на час»).
 
 Визуальный слой (render.py): день рисуется вертикальным таймлайном, неделя —
 hour-heatmap, поиск слота — полосой занятости, статистика — бар-чартом,
@@ -25,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import io
 import re
+import time
 import uuid
 from datetime import datetime, timedelta, date
 
@@ -130,6 +135,10 @@ CALPICK: dict[str, list[str]] = {}
 SLOTS: dict[str, dict] = {}
 # undo после создания: token -> {"uid","cal"}
 UNDO: dict[str, dict] = {}
+# краткая память диалога: chat_id -> последние показанные события
+# (для ссылок «перенеси её», «а вторую удали» и точного match_title в правках)
+CONTEXT: dict[int, dict] = {}
+CONTEXT_TTL = 15 * 60  # секунд
 
 
 # ---------- вспомогательное ----------
@@ -289,6 +298,51 @@ def _iso(s: str | None, tz) -> datetime | None:
 
 def _norm_title(t: str) -> str:
     return re.sub(r"^\W+", "", t or "").lower().strip()
+
+
+async def _typing(bot: Bot, chat_id: int):
+    """Показать «печатает…», пока думает LLM — вместо глухой тишины."""
+    try:
+        await bot.send_chat_action(chat_id, "typing")
+    except Exception:
+        pass
+
+
+def remember_events(chat_id: int, events: list[dict]):
+    """Запомнить последние показанные события — для ссылок «её/это/вторую»."""
+    items = []
+    for e in events[:12]:
+        s = e.get("start")
+        if s is None:
+            continue
+        items.append({
+            "title": e.get("title") or "",
+            "start": s.isoformat() if hasattr(s, "isoformat") else str(s),
+            "all_day": bool(e.get("all_day")),
+            "recurrence": bool(e.get("recurrence")),
+        })
+    if items:
+        CONTEXT[chat_id] = {"events": items, "ts": time.monotonic()}
+
+
+def context_block(chat_id: int, tz) -> str:
+    """Компактный блок контекста для LLM; пустая строка, если контекст протух."""
+    data = CONTEXT.get(chat_id)
+    if not data or time.monotonic() - data["ts"] > CONTEXT_TTL:
+        return ""
+    lines = []
+    for it in data["events"]:
+        try:
+            dt = datetime.fromisoformat(it["start"])
+            if isinstance(dt, datetime) and dt.tzinfo is None:
+                dt = tz.localize(dt)
+            when = fmt_dt(dt, it["all_day"], tz)
+        except ValueError:
+            when = it["start"]
+        rec = " (повторяется)" if it.get("recurrence") else ""
+        lines.append(f"- {when} — {it['title']}{rec}")
+    return ("Недавно показанные события (если пользователь ссылается «её», «это», "
+            "«первую» — речь о них):\n" + "\n".join(lines))
 
 
 # ---------- доступ ----------
@@ -461,7 +515,7 @@ async def _attach_conflict_warning(sent_msg, token: str, user_id: int, ev: Event
 
 # ---------- разбор результата LLM ----------
 
-async def handle_parsed(message: Message, parsed: dict, u: dict):
+async def handle_parsed(message: Message, parsed: dict, u: dict, source_text: str = ""):
     intent = parsed.get("intent", "chitchat")
     tz = user_tz(u["user_id"])
 
@@ -492,7 +546,7 @@ async def handle_parsed(message: Message, parsed: dict, u: dict):
         await send_schedule(message, dt_from, dt_to, u["user_id"])
 
     elif intent == "edit":
-        await handle_edit(message, parsed.get("edit") or {}, u)
+        await handle_edit(message, parsed.get("edit") or {}, u, source_text)
 
     elif intent == "find_slot":
         await handle_find_slot(message, parsed.get("slot") or {}, u)
@@ -516,6 +570,7 @@ async def send_schedule(message: Message, dt_from: datetime, dt_to: datetime, us
     if not events:
         await message.answer("На этот период событий нет 🎉")
         return
+    remember_events(message.chat.id, events)
     header = f"🗓 {dt_from.strftime('%d.%m')} – {dt_to.strftime('%d.%m')}\n"
     lines = []
     cur_day = None
@@ -543,55 +598,479 @@ def _schedule_line(e: dict, tz) -> str:
     return line
 
 
-# --- текстовая правка (запасной путь для «перенеси врача») ---
+# --- текстовая правка: «утренняя встреча перенеслась на вечер», «отмени тренировку» ---
 
-async def handle_edit(message: Message, edit: dict, u: dict):
+POD_HOURS = {"morning": 9, "afternoon": 14, "evening": 18, "night": 21}
+POD_RANGES = {"morning": (5, 12), "afternoon": (12, 17), "evening": (17, 23), "night": (20, 24)}
+
+
+def _trim(d: dict, cap: int = 3000):
+    """Не давать словарям токенов расти бесконечно (память процесса)."""
+    while len(d) > cap:
+        d.pop(next(iter(d)))
+
+
+def _word_overlap(a: str, b: str) -> bool:
+    aw, bw = set(a.split()), set(b.split())
+    return len(aw & bw) >= 1 and (len(aw & bw) / max(1, min(len(aw), len(bw)))) >= 0.5
+
+
+def _lex_match(needle: str, title: str) -> bool:
+    n = (needle or "").lower().strip()
+    t = re.sub(r"^\W+\s*", "", (title or "").lower()).strip()  # срезать эмодзи категории
+    if not n or not t:
+        return False
+    return n in t or t in n or _word_overlap(n, t)
+
+
+def _dedupe_candidates(events: list[dict], tz) -> list[dict]:
+    """Одно событие на UID: развёрнутая серия схлопывается до ближайшего
+    будущего вхождения (или последнего прошедшего, если будущих в окне нет).
+    Иначе «перенеси йогу» находила бы 13 одинаковых «йог»."""
+    ref = now(tz)
+    best: dict[str, dict] = {}
+    for e in events:
+        cur = best.get(e["uid"])
+        if cur is None:
+            best[e["uid"]] = e
+            continue
+        s_new, s_cur = _to_dt(e["start"], tz), _to_dt(cur["start"], tz)
+        new_fut, cur_fut = s_new >= ref, s_cur >= ref
+        better = (new_fut and not cur_fut) or (
+            new_fut == cur_fut and (s_new < s_cur if new_fut else s_new > s_cur))
+        if better:
+            best[e["uid"]] = e
+    out = list(best.values())
+    out.sort(key=lambda e: _to_dt(e["start"], tz))
+    return out
+
+
+def _in_part_of_day(e: dict, pod: str, tz) -> bool:
+    if e["all_day"] or not isinstance(e["start"], datetime):
+        return False
+    lo, hi = POD_RANGES.get(pod, (0, 24))
+    return lo <= _to_dt(e["start"], tz).astimezone(tz).hour < hi
+
+
+def _keep_emoji(old_title: str, new_title: str) -> str:
+    """Переименование не должно терять эмодзи категории."""
+    first = (old_title or "").split(" ")[0]
+    if first in EMOJI_TO_CATEGORY and (new_title or "").split(" ")[0] not in EMOJI_TO_CATEGORY:
+        return f"{first} {new_title}"
+    return new_title
+
+
+def _as_int(v) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_changes(base: Event, changes: dict, tz) -> Event:
+    """Применить правки к событию. Ключевое правило: если названо только новое
+    начало — длительность сохраняется (конец сдвигается вместе с началом)."""
+    ev = Event.from_dict(base.to_dict())
+    old_start = _to_dt(ev.start, tz)
+    old_end = _to_dt(ev.end, tz) if ev.end else None
+    duration = (old_end - old_start) if old_end else timedelta(hours=1)
+
+    if changes.get("title"):
+        ev.title = _keep_emoji(ev.title, str(changes["title"]).strip())
+
+    new_start = _iso(changes.get("start"), tz)
+    shift = _as_int(changes.get("shift_minutes"))
+    pod = changes.get("part_of_day")
+    if new_start is None and shift:
+        new_start = old_start + timedelta(minutes=shift)
+    if new_start is None and pod in POD_HOURS:
+        new_start = old_start.astimezone(tz).replace(
+            hour=POD_HOURS[pod], minute=0, second=0, microsecond=0)
+        ev.all_day = False  # часть дня = у события появляется время
+
+    new_end = _iso(changes.get("end"), tz)
+    dur_min = _as_int(changes.get("duration_minutes"))
+    if changes.get("all_day") is True:
+        ev.all_day = True
+
+    if new_start is not None:
+        if ev.all_day and (new_start.hour or new_start.minute):
+            ev.all_day = False  # явное время превращает «весь день» в обычное
+        ev.start = new_start
+        if new_end is not None:
+            ev.end = new_end
+        elif dur_min:
+            ev.end = new_start + timedelta(minutes=dur_min)
+        elif ev.all_day:
+            ev.end = None
+        else:
+            ev.end = new_start + duration
+    else:
+        if new_end is not None:
+            ev.end = new_end
+        elif dur_min:
+            ev.end = old_start + timedelta(minutes=dur_min)
+
+    if "location" in changes:
+        ev.location = changes.get("location")
+    if "notes" in changes:
+        ev.notes = changes.get("notes")
+    if changes.get("reminders_minutes"):
+        mins = [m for m in map(_as_int, changes["reminders_minutes"]) if m]
+        if mins:
+            ev.reminders_minutes = sorted({abs(m) for m in mins})
+    return ev
+
+
+def _fmt_span(ev: Event, tz) -> str:
+    s = fmt_dt(ev.start, ev.all_day, tz)
+    if ev.end and not ev.all_day:
+        s += f" – {ev.end.astimezone(tz).strftime('%H:%M')}"
+    return s
+
+
+def _diff_block(old: Event, new: Event, tz) -> str:
+    """«Было → станет»: ошибка выбора события видна ДО подтверждения."""
+    rows = []
+    if old.title != new.title:
+        rows.append(f"✏️ {old.title} → <b>{new.title}</b>")
+    if _fmt_span(old, tz) != _fmt_span(new, tz):
+        rows.append(f"🕒 {_fmt_span(old, tz)} → <b>{_fmt_span(new, tz)}</b>")
+    if (old.location or "") != (new.location or ""):
+        rows.append(f"📍 {old.location or '—'} → <b>{new.location or '—'}</b>")
+    if (old.notes or "") != (new.notes or ""):
+        rows.append("📝 Заметка обновлена")
+    if sorted(old.reminders_minutes) != sorted(new.reminders_minutes):
+        o = ", ".join(rem_label(m) for m in sorted(old.reminders_minutes)) or "нет"
+        n = ", ".join(rem_label(m) for m in sorted(new.reminders_minutes)) or "нет"
+        rows.append(f"🔔 {o} → <b>{n}</b>")
+    return "\n".join(rows)
+
+
+def _slim(e: dict) -> dict:
+    """Компактная запись кандидата для PENDING (переживает выбор кнопкой)."""
+    s, en = e.get("start"), e.get("end")
+    return {"uid": e["uid"], "cal": e.get("calendar") or e.get("cal"),
+            "title": e.get("title") or "",
+            "start": s.isoformat() if hasattr(s, "isoformat") else s,
+            "end": en.isoformat() if hasattr(en, "isoformat") else en,
+            "all_day": bool(e.get("all_day"))}
+
+
+def _fatten(it: dict) -> dict:
+    """Обратно из компактной записи: iso-строки -> datetime."""
+    def parse(v):
+        if not v or isinstance(v, (datetime, date)):
+            return v
+        try:
+            return datetime.fromisoformat(v)
+        except ValueError:
+            return None
+    return {"uid": it["uid"], "cal": it.get("cal"), "title": it.get("title", ""),
+            "start": parse(it.get("start")), "end": parse(it.get("end")),
+            "all_day": bool(it.get("all_day"))}
+
+
+def _cand_block(pool: list[dict], tz) -> str:
+    """Пронумерованный список реальных событий для второго шага LLM."""
+    lines = []
+    for i, e in enumerate(pool, 1):
+        span = fmt_dt(e["start"], e["all_day"], tz)
+        if e.get("end") and isinstance(e["end"], datetime) and not e["all_day"]:
+            span += f"–{_to_dt(e['end'], tz).astimezone(tz).strftime('%H:%M')}"
+        rec = " (повторяется)" if e.get("recurrence") else ""
+        lines.append(f"{i}. {span} — {e['title']}{rec}")
+    return "\n".join(lines)
+
+
+async def handle_edit(message: Message, edit: dict, u: dict, source_text: str = ""):
+    """Текстовая правка в два шага: разбор фразы -> сопоставление с РЕАЛЬНЫМИ
+    событиями (лексика, при неоднозначности — LLM по смыслу) -> карточка с диффом."""
     tz = user_tz(u["user_id"])
     title = (edit.get("match_title") or "").strip()
+    hint = edit.get("match_hint") or {}
+    op = (edit.get("op") or "modify").lower()
     changes = edit.get("changes") or {}
-    if not title:
-        await message.answer("Какое событие изменить? Напиши название или тапни его в списке (📅 Сегодня).")
+    if op != "delete" and not changes and not title:
+        await message.answer("Какое событие изменить и как? Например: «перенеси врача на 18:00».")
         return
+
+    # окно поиска: из подсказки; иначе вчера..+14 дней (прошлое для правок — шум)
+    dt_from = _iso(hint.get("from"), tz) or (now(tz) - timedelta(days=1))
+    dt_to = _iso(hint.get("to"), tz) or (now(tz) + timedelta(days=14))
+    if dt_to <= dt_from:
+        dt_to = dt_from + timedelta(days=1)
+
     try:
         client = cal.for_user(u["user_id"])
-        matches = await asyncio.to_thread(
-            client.find_by_title, title, now(tz) - timedelta(days=30), now(tz) + timedelta(days=60)
-        )
+        events = await asyncio.to_thread(client.list_events, dt_from, dt_to)
     except Exception as e:
         await message.answer(f"⚠️ Не смог прочитать календарь: {e}")
         return
-    if not matches:
-        await message.answer(f"Не нашёл событие «{title}» в календаре.")
-        return
-    if len(matches) > 1:
-        opts = "\n".join(f"• {fmt_dt(m['start'], m['all_day'], tz)} — {m['title']}" for m in matches[:8])
-        await message.answer(f"Нашёл несколько «{title}». Уточни или тапни в списке:\n{opts}")
+
+    cands = _dedupe_candidates(events, tz)
+    pod = hint.get("part_of_day")
+    if pod:
+        narrowed = [e for e in cands if _in_part_of_day(e, pod, tz)]
+        if narrowed:
+            cands = narrowed
+    if not cands:
+        await message.answer("В этом периоде событий не нашёл. Уточни день "
+                             "(«созвон в четверг») или тапни событие в списке (📅 Сегодня).")
         return
 
-    target = matches[0]
-    base = await asyncio.to_thread(client.get_event, target["uid"], target.get("calendar")) or target
-    new = event_from_caldav(base, tz)
-    if changes.get("title"):
-        new.title = changes["title"]
-    if _iso(changes.get("start"), tz):
-        new.start = _iso(changes["start"], tz)
-    if _iso(changes.get("end"), tz):
-        new.end = _iso(changes["end"], tz)
-    if "location" in changes:
-        new.location = changes["location"]
-    if "notes" in changes:
-        new.notes = changes["notes"]
-    if changes.get("reminders_minutes"):
-        new.reminders_minutes = changes["reminders_minutes"]
+    lex = [e for e in cands if _lex_match(title, e["title"])] if title else []
+    if len(lex) == 1:
+        # быстрый путь: однозначное совпадение по названию, без второго вызова LLM
+        await _stage_edit(message, lex[0], changes, op, u)
+        return
+
+    pool = (lex if len(lex) > 1 else cands)[:25]
+    res = {}
+    try:
+        res = await llm.resolve_edit(source_text or title or "", _cand_block(pool, tz),
+                                     now(tz), user_tz_name(u))
+    except Exception:
+        pass  # выбор по смыслу не удался — ниже честный запасной путь
+    pick = _as_int(res.get("pick"))
+    idxs = [i for i in map(_as_int, res.get("candidates") or [])
+            if i and 1 <= i <= len(pool)][:6]
+    if pick and 1 <= pick <= len(pool):
+        await _stage_edit(message, pool[pick - 1], changes, op, u)
+        return
+    if not idxs and lex:
+        idxs = list(range(1, min(len(lex), 6) + 1))
+    if idxs:
+        token = new_token()
+        PENDING[token] = {"action": "edit_pick",
+                          "items": [_slim(pool[i - 1]) for i in idxs],
+                          "changes": changes, "op": op,
+                          "user_id": u["user_id"], "chat_id": message.chat.id}
+        _trim(PENDING)
+        rows = []
+        for j, i in enumerate(idxs):
+            e = pool[i - 1]
+            rows.append([InlineKeyboardButton(
+                text=f"{fmt_dt(e['start'], e['all_day'], tz)} · {e['title']}"[:60],
+                callback_data=f"epk:{token}:{j}")])
+        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"no:{token}")])
+        verb = "удалить" if op == "delete" else "изменить"
+        await message.answer(f"Какое событие {verb}?",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        return
+    await message.answer(
+        f"Не нашёл событие «{title or source_text or '…'}» "
+        f"({dt_from.strftime('%d.%m')}–{dt_to.strftime('%d.%m')}). "
+        "Уточни день или тапни событие в списке (📅 Сегодня)."
+    )
+
+
+async def _stage_edit(msg: Message, target: dict, changes: dict, op: str, u: dict,
+                      via_edit: bool = False):
+    """Выбранное событие -> карточка подтверждения: дифф «было → станет»;
+    для серии — вопрос «только это вхождение / всю серию»."""
+    tz = user_tz(u["user_id"])
+
+    async def out(text, kb=None):
+        if via_edit:
+            await msg.edit_text(text, reply_markup=kb)
+        else:
+            await msg.answer(text, reply_markup=kb)
+
+    try:
+        client = cal.for_user(u["user_id"])
+        cal_hint = target.get("cal") or target.get("calendar")
+        base = await asyncio.to_thread(client.get_event, target["uid"], cal_hint)
+    except Exception as e:
+        await out(f"⚠️ Не смог прочитать календарь: {e}")
+        return
+    if not base:
+        await out("⚠️ Событие не найдено (возможно, удалено).")
+        return
+
+    recurring = bool(base.get("recurrence"))
+    cal_name = base.get("calendar") or cal_hint
+    master = event_from_caldav(base, tz)
+
+    # точка отсчёта — конкретное ВХОЖДЕНИЕ серии (из списка), а не мастер:
+    # иначе «перенеси йогу во вторник» считалась бы от первого вхождения серии
+    occ = Event.from_dict(master.to_dict())
+    if recurring and target.get("start") is not None:
+        occ.start = _to_dt(target["start"], tz)
+        if target.get("end") is not None:
+            occ.end = _to_dt(target["end"], tz)
+        elif master.end:
+            occ.end = occ.start + (master.end - master.start)
+        occ.all_day = bool(target.get("all_day", master.all_day))
+
+    if op == "delete":
+        token = new_token()
+        PENDING[token] = {"action": "edel", "uid": target["uid"], "cal": cal_name,
+                          "recurring": recurring, "occ_start": occ.start.isoformat(),
+                          "user_id": u["user_id"], "chat_id": msg.chat.id}
+        _trim(PENDING)
+        if recurring:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🗓 Только это", callback_data=f"sc1:{token}"),
+                 InlineKeyboardButton(text="🔁 Всю серию", callback_data=f"sca:{token}")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"no:{token}")],
+            ])
+            await out("🗑 Удалить повторяющееся событие?\n\n" + event_card(occ, tz, cal_name)
+                      + "\n\nТолько это вхождение или всю серию?", kb)
+        else:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"sca:{token}"),
+                InlineKeyboardButton(text="❌ Нет", callback_data=f"no:{token}"),
+            ]])
+            await out("🗑 Удалить событие?\n\n" + event_card(occ, tz, cal_name), kb)
+        return
+
+    new_occ = _apply_changes(occ, changes, tz)
+    diff = _diff_block(occ, new_occ, tz)
+    if not diff:
+        await out("Не понял, что именно изменить. Скажи, например: "
+                  "«перенеси на 18:00», «на час позже» или «переименуй в …».")
+        return
 
     token = new_token()
-    PENDING[token] = {"action": "edit", "event": new.to_dict(),
-                      "uid": target["uid"], "cal": target.get("calendar"),
-                      "user_id": u["user_id"], "chat_id": message.chat.id}
-    await message.answer(
-        "Изменить на:\n\n" + event_card(new, tz) + "\n\nПрименить?",
-        reply_markup=edit_confirm_kb(token),
-    )
+    if recurring:
+        # серия: тот же сдвиг/правки переносим на мастер — БЕЗ переякоривания
+        # даты серии на дату вхождения
+        delta = new_occ.start - occ.start
+        series = Event.from_dict(master.to_dict())
+        if delta:
+            series.start = series.start + delta
+            if series.end:
+                series.end = series.end + delta
+        if occ.all_day != new_occ.all_day:
+            series.all_day = new_occ.all_day
+        if occ.title != new_occ.title:
+            series.title = new_occ.title
+        if (occ.location or "") != (new_occ.location or ""):
+            series.location = new_occ.location
+        if (occ.notes or "") != (new_occ.notes or ""):
+            series.notes = new_occ.notes
+        if sorted(occ.reminders_minutes) != sorted(new_occ.reminders_minutes):
+            series.reminders_minutes = list(new_occ.reminders_minutes)
+        d_old = (occ.end - occ.start) if (occ.end and not occ.all_day) else None
+        d_new = (new_occ.end - new_occ.start) if (new_occ.end and not new_occ.all_day) else None
+        if d_new and d_new != d_old and not series.all_day:
+            series.end = series.start + d_new
+        single = Event.from_dict(new_occ.to_dict())
+        single.recurrence = None
+        single.uid = None
+        PENDING[token] = {"action": "editsc", "uid": target["uid"], "cal": cal_name,
+                          "occ_start": occ.start.isoformat(),
+                          "single": single.to_dict(), "series": series.to_dict(),
+                          "user_id": u["user_id"], "chat_id": msg.chat.id}
+        _trim(PENDING)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗓 Только это", callback_data=f"sc1:{token}"),
+             InlineKeyboardButton(text="🔁 Всю серию", callback_data=f"sca:{token}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"no:{token}")],
+        ])
+        await out(f"Изменить повторяющееся событие:\n\n<b>{occ.title}</b>\n{diff}"
+                  "\n\nТолько это вхождение или всю серию?", kb)
+    else:
+        PENDING[token] = {"action": "edit", "event": new_occ.to_dict(),
+                          "uid": target["uid"], "cal": cal_name,
+                          "user_id": u["user_id"], "chat_id": msg.chat.id}
+        _trim(PENDING)
+        await out(f"Изменить:\n\n<b>{occ.title}</b>\n{diff}\n\nПрименить?",
+                  edit_confirm_kb(token))
+
+
+@dp.callback_query(F.data.startswith("epk:"))
+async def cb_edit_pick(cq: CallbackQuery):
+    """Пользователь выбрал событие из предложенных кандидатов."""
+    _, token, j = cq.data.split(":")
+    data = PENDING.pop(token, None)
+    if not data or data.get("action") != "edit_pick" or int(j) >= len(data["items"]):
+        await cq.answer("Устарело — повтори просьбу текстом", show_alert=True)
+        return
+    u = store.get_user(data["user_id"])
+    if not u:
+        await cq.answer("Устарело", show_alert=True)
+        return
+    await cq.answer()
+    target = _fatten(data["items"][int(j)])
+    await _stage_edit(cq.message, target, data["changes"], data["op"], u, via_edit=True)
+
+
+@dp.callback_query(F.data.startswith("sc1:"))
+async def cb_scope_one(cq: CallbackQuery):
+    """«Только это»: правка/удаление одного вхождения серии (EXDATE + копия)."""
+    token = cq.data.split(":", 1)[1]
+    data = PENDING.pop(token, None)
+    if not data or data.get("action") not in ("edel", "editsc"):
+        await cq.answer("Устарело", show_alert=True)
+        return
+    await cq.answer()
+    tz = user_tz(data["user_id"])
+    client = client_or_none(data["user_id"])
+    if client is None:
+        await cq.message.edit_text("Календарь не подключён — открой ⚙️ Настройки.")
+        return
+    occ_start = datetime.fromisoformat(data["occ_start"])
+    await cq.message.edit_text("⏳ Применяю…")
+    try:
+        ok = await asyncio.to_thread(client.exclude_occurrence, data["uid"],
+                                     occ_start, data.get("cal"))
+        if not ok:
+            await cq.message.edit_text("⚠️ Событие не найдено в календаре.")
+            return
+        if data["action"] == "edel":
+            await cq.message.edit_text("🗑 Это вхождение удалено, серия осталась.")
+            return
+        ev = Event.from_dict(data["single"])
+        uid, cal_name = await asyncio.to_thread(client.create_event, ev, data.get("cal"))
+        store.add(uid, data["chat_id"], ev.title, ev.start, cal_name)
+        remember_events(data["chat_id"], [{"title": ev.title, "start": ev.start,
+                                           "all_day": ev.all_day,
+                                           "recurrence": ev.recurrence}])
+        await cq.message.edit_text("✅ Изменено (только это вхождение)\n\n"
+                                   + event_card(ev, tz, cal_name))
+    except Exception as e:
+        await cq.message.edit_text(f"⚠️ Ошибка: {e}")
+
+
+@dp.callback_query(F.data.startswith("sca:"))
+async def cb_scope_all(cq: CallbackQuery):
+    """«Всю серию» / удаление обычного события."""
+    token = cq.data.split(":", 1)[1]
+    data = PENDING.pop(token, None)
+    if not data or data.get("action") not in ("edel", "editsc"):
+        await cq.answer("Устарело", show_alert=True)
+        return
+    await cq.answer()
+    tz = user_tz(data["user_id"])
+    client = client_or_none(data["user_id"])
+    if client is None:
+        await cq.message.edit_text("Календарь не подключён — открой ⚙️ Настройки.")
+        return
+    await cq.message.edit_text("⏳ Применяю…")
+    try:
+        if data["action"] == "edel":
+            ok = await asyncio.to_thread(client.delete_event, data["uid"], data.get("cal"))
+            if ok:
+                store.remove(data["uid"])
+                await cq.message.edit_text("🗑 Серия удалена." if data.get("recurring")
+                                           else "🗑 Событие удалено.")
+            else:
+                await cq.message.edit_text("⚠️ Событие не найдено (возможно, уже удалено).")
+            return
+        ev = Event.from_dict(data["series"])
+        ok = await asyncio.to_thread(client.update_event, data["uid"], ev, data.get("cal"))
+        if ok:
+            store.update_start(data["uid"], ev.title, ev.start)
+            remember_events(data["chat_id"], [{"title": ev.title, "start": ev.start,
+                                               "all_day": ev.all_day,
+                                               "recurrence": ev.recurrence}])
+            await cq.message.edit_text("✅ Серия изменена\n\n" + event_card(ev, tz))
+        else:
+            await cq.message.edit_text("⚠️ Событие не найдено в календаре.")
+    except Exception as e:
+        await cq.message.edit_text(f"⚠️ Ошибка: {e}")
 
 
 # ---------- поиск свободного слота ----------
@@ -829,6 +1308,7 @@ async def render_day(offset: int, user_id: int) -> tuple[str, InlineKeyboardMark
     rows = [nav]
 
     # текст — вертикальный таймлайн (render.py); кнопки-события оставляем тапабельными
+    remember_events(user_id, events)
     for e in events:
         token = new_token()
         EVENTS[token] = {"uid": e["uid"], "offset": offset, "cal": e.get("calendar")}
@@ -838,6 +1318,7 @@ async def render_day(offset: int, user_id: int) -> tuple[str, InlineKeyboardMark
             text=f"{when} · {e['title']}"[:60],
             callback_data=f"ev:{token}",
         )])
+    _trim(EVENTS, 6000)
     text = render.day_timeline(events, tz, day_title(offset, tz))
     if events:
         text += "\nТапни событие ниже, чтобы изменить."
@@ -858,6 +1339,7 @@ async def render_month(message: Message, user_id: int):
     if not events:
         await message.answer("На ближайший месяц событий нет 🎉")
         return
+    remember_events(message.chat.id, events)
     lines = ["📆 <b>Ближайшие 30 дней</b>"]
     cur_day = None
     for e in events:
@@ -942,7 +1424,8 @@ START_TEXT = (
     "🧠 Вопросы о планах — «что у меня завтра?»\n"
     "🔍 Поиск свободного времени — «найди час на этой неделе для встречи»\n"
     "🧹 Массовые операции — «отмени всё в пятницу», «сдвинь созвоны на час»\n"
-    "✏️ Правки кнопками (тапни событие в списке) или текстом — «перенеси врача на 18:00»\n"
+    "✏️ Правки текстом — «утренняя встреча перенеслась на вечер», «отмени тренировку», "
+    "«сдвинь созвон на час» — или кнопками (тапни событие в списке)\n"
     "⚠️ Предупреждаю о дублях и пересечениях в расписании\n"
     "📁 Выбор календаря прямо в карточке события\n"
     "⏰ Напоминания: нативные + пинг в чат с кнопкой «+15 мин»\n"
@@ -1024,6 +1507,7 @@ async def btn_reminders(message: Message):
             text=f"{fmt_dt(e['start'], e['all_day'], tz)} · {e['title']} — {rem}"[:60],
             callback_data=f"rem:{token}",
         )])
+    _trim(EVENTS, 6000)
     await message.answer(
         "🔔 <b>Напоминания</b>\nТапни событие, чтобы настроить:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -1298,6 +1782,7 @@ async def on_voice(message: Message, bot: Bot):
         await message.answer("Голосовые сейчас отключены. Пришли событие текстом или фото афиши 🙂")
         return
     file_id = message.voice.file_id if message.voice else message.audio.file_id
+    await _typing(bot, message.chat.id)
     buf = io.BytesIO()
     await bot.download(file_id, destination=buf)
     try:
@@ -1309,8 +1794,16 @@ async def on_voice(message: Message, bot: Bot):
         await message.answer("Не разобрал голосовое, повтори?")
         return
     tzname = user_tz_name(u)
-    parsed = await llm.parse_text(text, now(user_tz(u["user_id"])), tzname)
-    await handle_parsed(message, parsed, u)
+    try:
+        parsed = await llm.parse_text(
+            text, now(user_tz(u["user_id"])), tzname,
+            context=context_block(message.chat.id, user_tz(u["user_id"])),
+        )
+    except Exception:
+        await message.answer("⚠️ Не смог разобрать сообщение — сбой на моей стороне. "
+                             "Попробуй ещё раз через минуту.")
+        return
+    await handle_parsed(message, parsed, u, source_text=text)
 
 
 @dp.message(F.photo)
@@ -1318,6 +1811,7 @@ async def on_photo(message: Message, bot: Bot):
     u = await ensure_ready(message)
     if not u:
         return
+    await _typing(bot, message.chat.id)
     buf = io.BytesIO()
     await bot.download(message.photo[-1].file_id, destination=buf)
     tzname = user_tz_name(u)
@@ -1328,7 +1822,7 @@ async def on_photo(message: Message, bot: Bot):
     except Exception as e:
         await message.answer(f"⚠️ Не разобрал изображение: {e}")
         return
-    await handle_parsed(message, parsed, u)
+    await handle_parsed(message, parsed, u, source_text=message.caption or "")
 
 
 @dp.message(F.document)
@@ -1350,6 +1844,7 @@ async def on_document(message: Message, bot: Bot):
     media_type = mime if mime in (
         "image/jpeg", "image/png", "image/gif", "image/webp"
     ) else "image/jpeg"
+    await _typing(bot, message.chat.id)
     buf = io.BytesIO()
     await bot.download(doc.file_id, destination=buf)
     tzname = user_tz_name(u)
@@ -1361,7 +1856,7 @@ async def on_document(message: Message, bot: Bot):
     except Exception as e:
         await message.answer(f"⚠️ Не разобрал изображение: {e}")
         return
-    await handle_parsed(message, parsed, u)
+    await handle_parsed(message, parsed, u, source_text=message.caption or "")
 
 
 @dp.message(F.text)
@@ -1380,9 +1875,18 @@ async def on_text(message: Message, bot: Bot):
     if pending:
         await handle_awaited_text(message, pending, u)
         return
+    await _typing(bot, message.chat.id)
     tzname = user_tz_name(u)
-    parsed = await llm.parse_text(message.text, now(user_tz(uid)), tzname)
-    await handle_parsed(message, parsed, u)
+    try:
+        parsed = await llm.parse_text(
+            message.text, now(user_tz(uid)), tzname,
+            context=context_block(message.chat.id, user_tz(uid)),
+        )
+    except Exception:
+        await message.answer("⚠️ Не смог разобрать сообщение — сбой на моей стороне. "
+                             "Попробуй ещё раз через минуту.")
+        return
+    await handle_parsed(message, parsed, u, source_text=message.text)
 
 
 @dp.message()
@@ -1481,7 +1985,7 @@ async def handle_awaited_text(message: Message, pending: dict, u: dict):
             await message.answer("⚠️ Событие не найдено.")
             return
         ev = event_from_caldav(ev_dict, tz)
-        ev.title = message.text.strip()
+        ev.title = _keep_emoji(ev.title, message.text.strip())
         await _apply_update(message, pending["uid"], ev, "✅ Переименовано", u,
                             ev_dict.get("calendar"))
 
@@ -1917,6 +2421,9 @@ async def on_ok(cq: CallbackQuery):
                 client.create_event, ev, data.get("calendar")
             )
             store.add(uid, data["chat_id"], ev.title, ev.start, cal_name)
+            remember_events(data["chat_id"], [{"title": ev.title, "start": ev.start,
+                                               "all_day": ev.all_day,
+                                               "recurrence": ev.recurrence}])
             undo_token = new_token()
             UNDO[undo_token] = {"uid": uid, "cal": cal_name}
             kb = InlineKeyboardMarkup(inline_keyboard=[[
